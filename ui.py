@@ -6,7 +6,7 @@ from . import optimize
 class _Base:
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Apex Map"
+    bl_category = "R5 Map Loader"
 
 
 class APX_PT_import(_Base, bpy.types.Panel):
@@ -18,7 +18,18 @@ class APX_PT_import(_Base, bpy.types.Panel):
         col = self.layout.column()
         col.prop(s, "models_dir", text="Modèles")
         col.operator("apx.import_map", icon="IMPORT")
+        box = col.box()
+        box.label(text="Déplacer la map vers un SSD", icon="DISK_DRIVE")
+        box.prop(s, "copy_source", text="")
+        box.prop(s, "copy_max_texture", text="")
+        box.operator("apx.copy_map", icon="DUPLICATE")
         col.prop(s, "instancing_mode", text="")
+        box = col.box()
+        box.label(text="Entités (props dynamiques)", icon="OUTLINER_OB_EMPTY")
+        box.prop(s, "ent_path", text="")
+        box.prop(s, "ent_files")
+        box.prop(s, "import_ziplines")
+        box.label(text="R5Reloaded : vpk/englishserver_<map>.bsp.pak000_dir.vpk")
         box = col.box()
         box.label(text="Géométrie de la map (.cast)", icon="WORLD")
         box.prop(s, "import_world")
@@ -30,6 +41,8 @@ class APX_PT_import(_Base, bpy.types.Panel):
             box.prop(s, "cast_alpha_mode")
             box.prop(s, "cast_spec_to_metal")
             box.prop(s, "cast_flip_normal_green")
+            box.prop(s, "cast_extra_textures")
+        box.prop(s, "decal_offset")
         box.prop(s, "cast_weld")
         box.prop(s, "cast_custom_normals")
         box = col.box()
@@ -69,23 +82,32 @@ class APX_PT_lod(_Base, bpy.types.Panel):
         col.prop(s, "lod_size_scaling")
         if s.lod_size_scaling:
             col.prop(s, "lod_reference_size")
-        col.separator()
-        col.prop(s, "use_culling")
+
+        box = col.box()
+        box.label(text="Déchargement (FPS)", icon="HIDE_ON")
+        box.prop(s, "use_frustum")
+        if s.use_frustum:
+            box.prop(s, "frustum_margin")
+        box.prop(s, "cull_small_props")
+        if s.cull_small_props:
+            box.prop(s, "min_screen_pct")
+        box.prop(s, "use_culling")
         if s.use_culling:
-            col.prop(s, "cull_distance")
-            col.prop(s, "cull_small_props")
-            if s.cull_small_props:
-                col.prop(s, "small_prop_size")
-                col.prop(s, "small_prop_distance")
-        col.prop(s, "use_bounds_level")
-        if s.use_bounds_level and s.instancing_mode == "GN":
-            col.label(text="(mode Empties uniquement)", icon="INFO")
-        if s.use_bounds_level:
-            col.prop(s, "bounds_distance")
-        col.separator()
-        col.prop(s, "render_mode")
-        col.prop(s, "update_interval")
-        col.prop(s, "update_move_threshold")
+            box.prop(s, "cull_distance")
+        if s.instancing_mode != "GN":
+            box.prop(s, "use_bounds_level")
+            if s.use_bounds_level:
+                box.prop(s, "bounds_distance")
+
+        box = col.box()
+        box.label(text="Rendu / mise à jour", icon="RENDER_STILL")
+        box.prop(s, "render_mode")
+        if s.render_mode == "CAMERA":
+            box.prop(s, "render_frustum")
+        box.prop(s, "update_settle")
+        box.prop(s, "update_interval")
+        box.prop(s, "update_move_threshold")
+        box.prop(s, "update_angle_threshold")
         col.operator("apx.show_all", icon="HIDE_OFF")
 
 
@@ -104,6 +126,26 @@ class APX_PT_lod_import(_Base, bpy.types.Panel):
             col.prop(s, "auto_lod_min_faces")
 
 
+class APX_PT_visibility(_Base, bpy.types.Panel):
+    bl_label = "Visibilité (triggers…)"
+    bl_idname = "APX_PT_visibility"
+
+    def draw(self, context):
+        from . import visibility
+        from .castfile import GROUPS
+        s = context.scene.apx_settings
+        counts = visibility.counts()
+        col = self.layout.column()
+        for g, label in GROUPS:
+            row = col.row(align=True)
+            hidden = getattr(s, f"hide_{g}")
+            row.prop(s, f"hide_{g}", text=f"{label} ({counts.get(g, 0)})", toggle=True,
+                     icon="HIDE_ON" if hidden else "HIDE_OFF", invert_checkbox=False)
+            op = row.operator("apx.select_group", text="", icon="RESTRICT_SELECT_OFF")
+            op.group = g
+        col.label(text="Bouton enfoncé = caché", icon="INFO")
+
+
 class APX_PT_optimize(_Base, bpy.types.Panel):
     bl_label = "Optimisation"
     bl_idname = "APX_PT_optimize"
@@ -114,6 +156,9 @@ class APX_PT_optimize(_Base, bpy.types.Panel):
         col.prop(s, "join_meshes")
         col.prop(s, "merge_distance")
         col.prop(s, "dedupe_on_import")
+        row = col.row(align=True)
+        row.prop(s, "texture_limit", text="Textures")
+        row.operator("apx.texture_limit", text="", icon="CHECKMARK")
         col.operator("apx.optimize", icon="MODIFIER")
         col.operator("apx.viewport_setup", icon="VIEW_CAMERA")
         col.operator("apx.make_real", icon="OUTLINER_OB_MESH")
@@ -124,7 +169,7 @@ class APX_PT_optimize(_Base, bpy.types.Panel):
         box.label(text=f"Triangles LOD0 (uniques) : {tris:,}".replace(",", " "))
 
 
-CLASSES = (APX_PT_import, APX_PT_lod, APX_PT_lod_import, APX_PT_optimize)
+CLASSES = (APX_PT_import, APX_PT_visibility, APX_PT_lod, APX_PT_lod_import, APX_PT_optimize)
 
 
 def register():

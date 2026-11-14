@@ -56,29 +56,47 @@ def _vec(text, n=3, default=0.0):
     return tuple(vals)
 
 
-def parse_ent(path):
-    out = []
+_ZIP_RE = re.compile(r"_zipline_rest_point_(\d+)$")
+
+
+def parse_ent_text(text):
+    """Renvoie (placements, tyroliennes). Une tyrolienne = liste de points (unités du jeu)."""
+    out, zips = [], []
     ent = None
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("{"):
+            ent = {}
+            continue
+        if s.startswith("}"):
+            if ent:
+                p = _from_dict(ent)
+                if p:
+                    out.append(p)
+                if ent.get("classname", "").startswith("zipline") and "_zipline_rest_point_0" in ent:
+                    pts = sorted((int(_ZIP_RE.search(k).group(1)), _vec(v))
+                                 for k, v in ent.items() if _ZIP_RE.search(k))
+                    if len(pts) >= 2:
+                        zips.append([p_ for _i, p_ in pts])
+            ent = None
+            continue
+        if ent is not None:
+            m = _KV_RE.match(s)
+            if m:
+                ent[m.group(1).lower()] = m.group(2)
+    return out, zips
+
+
+def parse_ent(path):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            s = line.strip()
-            if not s:
-                continue
-            if s.startswith("{"):
-                ent = {}
-                continue
-            if s.startswith("}"):
-                if ent:
-                    p = _from_dict(ent)
-                    if p:
-                        out.append(p)
-                ent = None
-                continue
-            if ent is not None:
-                m = _KV_RE.match(s)
-                if m:
-                    ent[m.group(1).lower()] = m.group(2)
-    return out
+        return parse_ent_text(f.read())[0]
+
+
+def ent_ziplines(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return parse_ent_text(f.read())[1]
 
 
 def _from_dict(d):

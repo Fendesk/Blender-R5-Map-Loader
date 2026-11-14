@@ -15,7 +15,7 @@ import bmesh
 import numpy as np
 from mathutils import Matrix
 
-SUPPORTED_EXT = (".glb", ".gltf", ".fbx", ".obj", ".cast", ".semodel", ".smd")
+SUPPORTED_EXT = (".cast", ".glb", ".gltf", ".fbx", ".obj", ".semodel", ".smd")
 LIB_COLLECTION = "APX_Library"
 
 _LOD_FILE_RE = re.compile(r"^(?P<base>.+?)[_\-\. ]?lod[_\-]?(?P<lod>\d+)$", re.IGNORECASE)
@@ -209,7 +209,10 @@ def _make_decimated(src_obj, ratio, name):
     me = bpy.data.meshes.new_from_object(tmp.evaluated_get(dg))
     me.name = name
     bpy.data.objects.remove(tmp, do_unlink=True)
-    return bpy.data.objects.new(name, me)
+    obj = bpy.data.objects.new(name, me)
+    if "apx_group" in src_obj:
+        obj["apx_group"] = src_obj["apx_group"]
+    return obj
 
 
 # --------------------------------------------------------------------------
@@ -256,10 +259,12 @@ def ensure_model(key, files, settings, scene):
                 for o in objs:
                     bpy.data.objects.remove(o, do_unlink=True)
                 continue
-            if settings.join_meshes:
-                lod_objects[glod] = [_join(objs, lod_collection_name(key, glod))]
-            else:
-                lod_objects[glod] = objs
+            # Les objets triggers/outils (apx_group) restent séparés pour pouvoir être cachés
+            normal = [o for o in objs if "apx_group" not in o]
+            special = [o for o in objs if "apx_group" in o]
+            if settings.join_meshes and normal:
+                normal = [_join(normal, lod_collection_name(key, glod))]
+            lod_objects[glod] = normal + special
 
     if not lod_objects:
         bpy.data.collections.remove(model_root)

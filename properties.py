@@ -14,11 +14,41 @@ def _lod_changed(self, context):
         print(f"[APX] {exc}")
 
 
+def _vis_changed(self, context):
+    from . import visibility
+    visibility.apply(context.scene)
+
+
 class APX_Settings(bpy.types.PropertyGroup):
+    # ---------------- Visibilité ----------------
+    hide_trigger: BoolProperty(name="Cacher les triggers", default=True, update=_vis_changed,
+                               description="toolstrigger, volumes de brouillard…")
+    hide_tool: BoolProperty(name="Cacher les brushes outils", default=True, update=_vis_changed,
+                            description="clip, blocklight, skybox, nodraw, invisible…")
+    hide_gamemode: BoolProperty(name="Cacher les barrières de mode de jeu", default=True, update=_vis_changed,
+                                description="Murs/bordures des modes Arènes, Contrôle… (matériaux ar_*)")
+    hide_dev: BoolProperty(name="Cacher les textures dev", default=True, update=_vis_changed,
+                           description="dev_* (damiers), test_*, placeholders. Les panneaux lumineux dev_*_light, "
+                                       "visibles en jeu, ne sont pas concernés")
+    decal_offset: FloatProperty(
+        name="Décalage des surcouches (unités jeu)", default=0.35, min=0.0, max=5.0, precision=3,
+        description="Décale les décals et surcouches de terrain (_b2t, _bt, decal…) au-dessus de la surface "
+                    "pour supprimer le scintillement (z-fighting). 0 = off")
+    cast_extra_textures: BoolProperty(
+        name="Ajouter les textures non utilisées", default=False,
+        description="Ajoute aussi AO, cavity, etc. dans les matériaux (non branchées, plus de mémoire)")
+    texture_limit: EnumProperty(
+        name="Résolution max des textures (viewport)",
+        items=[("CLAMP_OFF", "Illimitée", ""), ("CLAMP_2048", "2048", ""), ("CLAMP_1024", "1024", ""),
+               ("CLAMP_512", "512", ""), ("CLAMP_256", "256", "")],
+        default="CLAMP_1024",
+        description="Une map complète utilise des milliers de textures 2K : sans limite la mémoire vidéo "
+                    "sature et des textures ne s'affichent pas")
+
     # ---------------- Import ----------------
     models_dir: StringProperty(
         name="Dossier des modèles", subtype="DIR_PATH",
-        description="Dossier contenant les modèles exportés (Legion+ : .gltf/.glb/.fbx/.obj/.cast/.semodel). "
+        description="Dossier contenant les modèles exportés (RSX / Legion+ : .cast, ou .gltf/.glb/.fbx/.obj/.smd). "
                     "Les fichiers nommés *_LOD0, *_LOD1... sont reconnus comme LODs")
     unit_scale: FloatProperty(
         name="Échelle", default=0.0254, min=1e-5, precision=4,
@@ -34,8 +64,9 @@ class APX_Settings(bpy.types.PropertyGroup):
     split_by_category: BoolProperty(name="Collections par catégorie", default=True,
                                     description="Range les props par dossier (props, foliage, rocks...)")
     exclude_patterns: StringProperty(
-        name="Exclure", default="dev_,editor,trigger,clip,invisible,nodraw,collision,_col,fx/,error",
-        description="Motifs séparés par des virgules ; les modèles dont le chemin contient l'un d'eux sont ignorés")
+        name="Exclure", default="dev,editor,trigger,playerclip,invisible,nodraw,collision,error",
+        description="Mots séparés par des virgules. Un modèle est ignoré si un mot entier de son nom correspond "
+                    "(« col » exclut « rock_col » mais pas « column »). * = joker")
     use_region: BoolProperty(name="Limiter à une zone", default=False,
                              description="N'importe que les props dans un rayon autour d'un point (unités du jeu)")
     region_center: FloatVectorProperty(name="Centre", size=3, default=(0, 0, 0))
@@ -52,12 +83,38 @@ class APX_Settings(bpy.types.PropertyGroup):
                ("EMPTY", "Empties (1 objet par prop)",
                 "Chaque prop est sélectionnable/éditable. Lent au-delà de ~50 000 props")],
         default="GN")
+    copy_source: StringProperty(
+        name="Dossier de la map", subtype="DIR_PATH",
+        description="Dossier qui contient le .mprt, le .cast et _models (vide = parent du dossier des modèles)")
+    copy_max_texture: EnumProperty(
+        name="Textures",
+        items=[("1024", "Réduire à 1024 px (conseillé)", "Chargement ~4x plus rapide, 4x moins de mémoire vidéo"),
+               ("2048", "Réduire à 2048 px", ""),
+               ("512", "Réduire à 512 px (PC modeste)", ""),
+               ("0", "Taille d'origine", "Copie simple sans réduction")],
+        default="1024",
+        description="Les textures 2K mettent longtemps à se charger (décodage PNG) et saturent la mémoire vidéo")
+    ent_path: StringProperty(
+        name="Entités (.vpk / .ent)", subtype="FILE_PATH",
+        description="Optionnel, importé avec le .mprt : le VPK serveur de la map (R5Reloaded : "
+                    "vpk/englishserver_<map>.bsp.pak000_dir.vpk) ou un fichier .ent. Ajoute les props "
+                    "dynamiques (portes, coffres, tyroliennes...)")
+    ent_files: StringProperty(
+        name="Fichiers .ent du VPK", default="script",
+        description="Lesquels lire dans le VPK, séparés par des virgules : script, snd, spawn, env, fx "
+                    "(env et fx sont compressés dans les VPK R5Reloaded et ne peuvent pas être lus)")
+    import_ziplines: BoolProperty(name="Créer les tyroliennes", default=True,
+                                  description="Crée les câbles des tyroliennes en courbes à partir des .ent")
+    setup_viewport_on_import: BoolProperty(
+        name="Régler le viewport après import", default=True,
+        description="Mode Solid en couleur « Texture », distances d'affichage adaptées à une grande map")
     import_world: BoolProperty(
         name="Importer la géométrie de la map", default=True,
         description="Avec un .mprt : importe aussi le .cast de même nom (terrain, bâtiments)")
     world_tile_size: FloatProperty(
-        name="Taille des tuiles (m)", default=256.0, min=0.0,
-        description="La géométrie de la map est découpée en tuiles (0 = un seul objet)")
+        name="Taille des tuiles (m)", default=0.0, min=0.0,
+        description="0 = un seul objet (le plus rapide : mesuré 247 fps en Solid contre 62 fps avec des tuiles de "
+                    "256 m, car chaque tuile multiplie les appels de dessin par matériau)")
 
     # ---------------- Cast ----------------
     cast_load_textures: BoolProperty(name="Charger les textures", default=True)
@@ -92,7 +149,7 @@ class APX_Settings(bpy.types.PropertyGroup):
                                      description="Crée des LODs par décimation si le modèle n'en a qu'un")
     auto_lod_ratio: FloatProperty(name="Ratio de décimation", default=0.5, min=0.05, max=0.95,
                                   description="Chaque LOD garde ce ratio de faces du précédent")
-    auto_lod_min_faces: IntProperty(name="Faces min. pour générer", default=500, min=0)
+    auto_lod_min_faces: IntProperty(name="Faces min. pour générer", default=200, min=0)
     lod_distances: FloatVectorProperty(
         name="Distances LOD (m)", size=4, default=(25.0, 60.0, 150.0, 400.0), min=0.0,
         update=_lod_changed, description="Distance à partir de laquelle on passe au LOD1, LOD2, LOD3, LOD4")
@@ -103,11 +160,30 @@ class APX_Settings(bpy.types.PropertyGroup):
     lod_reference_size: FloatProperty(name="Taille de référence (m)", default=2.0, min=0.01, update=_lod_changed)
     use_bounds_level: BoolProperty(name="Boîtes englobantes au loin", default=False, update=_lod_changed)
     bounds_distance: FloatProperty(name="Distance boîtes (m)", default=800.0, min=0.0, update=_lod_changed)
-    use_culling: BoolProperty(name="Masquer au loin (culling)", default=True, update=_lod_changed)
-    cull_distance: FloatProperty(name="Distance de culling (m)", default=1500.0, min=0.0, update=_lod_changed)
-    cull_small_props: BoolProperty(name="Culling des petits props", default=True, update=_lod_changed)
+    use_culling: BoolProperty(name="Masquer au loin (culling)", default=False, update=_lod_changed,
+                              description="Cache les props lointains (plus fluide, mais la map n'est plus "
+                                          "entièrement visible)")
+    cull_distance: FloatProperty(name="Distance de culling (m)", default=3000.0, min=0.0, update=_lod_changed)
+    cull_small_props: BoolProperty(
+        name="Décharger les petits objets lointains", default=True, update=_lod_changed,
+        description="Cache un prop quand il devient plus petit qu'un certain pourcentage de la hauteur de "
+                    "l'écran (un petit objet disparaît vite, un gros rocher reste visible très loin)")
+    min_screen_pct: FloatProperty(
+        name="Taille min. à l'écran (%)", default=1.0, min=0.0, max=20.0, precision=2, update=_lod_changed,
+        description="Rayon minimal du prop en % de la demi-hauteur de l'écran (1 % ≈ 5 pixels de rayon en "
+                    "1080p). Mesuré sur World's Edge au sol : 0.6 % ≈ 19 fps, 1 % ≈ 35 fps, 2 % ≈ 48 fps")
+    use_frustum: BoolProperty(
+        name="Cacher hors du champ de vision", default=True, update=_lod_changed,
+        description="Les props derrière la caméra ou hors cadre ne sont pas instanciés (gros gain de FPS)")
+    frustum_margin: FloatProperty(
+        name="Marge du champ", default=1.5, min=1.0, max=3.0, update=_lod_changed,
+        description="Élargit le champ testé pour éviter de voir des props apparaître quand on tourne la vue")
+    render_frustum: BoolProperty(
+        name="Champ de vision au rendu", default=False,
+        description="Applique aussi le culling hors champ au rendu (plus rapide, mais les ombres et reflets "
+                    "des objets hors champ disparaissent)")
     small_prop_size: FloatProperty(name="Taille 'petit' (m)", default=0.5, min=0.0, update=_lod_changed)
-    small_prop_distance: FloatProperty(name="Distance petits props (m)", default=120.0, min=0.0,
+    small_prop_distance: FloatProperty(name="Distance petits props (m)", default=250.0, min=0.0,
                                        update=_lod_changed)
     lod_source: EnumProperty(
         name="Point de vue",
@@ -116,9 +192,17 @@ class APX_Settings(bpy.types.PropertyGroup):
         default="VIEWPORT", update=_lod_changed)
     lod_auto_update: BoolProperty(name="Mise à jour auto", default=True,
                                   description="Met à jour les LODs en continu pendant la navigation")
-    update_interval: FloatProperty(name="Intervalle (s)", default=0.25, min=0.05, max=5.0)
+    update_interval: FloatProperty(
+        name="Recalcul pendant le mouvement (s)", default=0.0, min=0.0, max=30.0,
+        description="0 = jamais pendant qu'on bouge (déplacement fluide, recalcul à l'arrêt). Sinon, recalcul "
+                    "forcé toutes les N secondes de mouvement continu (chaque recalcul gèle l'image ~0,3 s)")
+    update_settle: FloatProperty(
+        name="Délai après arrêt (s)", default=0.25, min=0.0, max=2.0,
+        description="Recalcule quand la vue est immobile depuis ce délai")
     update_move_threshold: FloatProperty(name="Seuil de déplacement (m)", default=2.0, min=0.0,
                                          description="Ne recalcule que si la vue a bougé de plus de cette distance")
+    update_angle_threshold: FloatProperty(name="Seuil de rotation (°)", default=6.0, min=0.0, max=90.0,
+                                          description="… ou a tourné de plus de cet angle")
     render_mode: EnumProperty(
         name="Au rendu",
         items=[("LOD0", "Tout en LOD0", "Qualité max au rendu"),
