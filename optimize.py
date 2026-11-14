@@ -92,8 +92,13 @@ def setup_viewport_for_large_map(clip_end=20000.0):
         for area in win.screen.areas:
             if area.type == "VIEW_3D":
                 sp = area.spaces.active
-                sp.clip_start = 0.1
+                sp.clip_start = 0.5   # un clip_start trop petit aggrave le z-fighting au loin
                 sp.clip_end = clip_end
+                # En mode Solid, Blender affiche sinon un gris uniforme : on montre les textures
+                try:
+                    sp.shading.color_type = "TEXTURE"
+                except (AttributeError, TypeError):
+                    pass
     scene = bpy.context.scene
     if scene.camera and scene.camera.type == "CAMERA":
         scene.camera.data.clip_end = max(scene.camera.data.clip_end, clip_end)

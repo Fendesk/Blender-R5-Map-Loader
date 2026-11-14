@@ -1,34 +1,126 @@
-"""Système de LOD dynamique (désactivable).
+"""Système de LOD + culling dynamique (désactivable).
 
-Principe : chaque prop est un empty qui instancie une collection. Changer de
-LOD = changer `instance_collection` -> aucune copie de géométrie, coût quasi nul.
-Les distances sont calculées en bloc avec numpy, et seuls les props dont le
-niveau change sont touchés.
+Deux modes d'instanciation :
+  - Geometry Nodes : on déplace seulement la sonde APX_LOD_Probe (position, rotation, champ
+    de vision) ; tout le reste est calculé par les nœuds (voir gn_instancer).
+  - Empties : chaque prop est un empty qui instancie une collection ; niveaux calculés en
+    bloc avec numpy, seuls les props qui changent de niveau sont touchés.
 
-Niveaux : 0..n-1 = LODs, n = boîte englobante (si présente), -1 = masqué (cull).
+Culling : hors du champ de vision (frustum), trop petit à l'écran, au-delà d'une distance.
+La mise à jour attend que la vue soit stable (anti-rebond) pour ne pas saccader.
 """
+
+import math
+import time
 
 import bpy
 import numpy as np
-from mathutils import Vector
+from mathutils import Quaternion, Vector
 
 from . import library
 
 LEVEL_CULLED = -1
 
 
+# --------------------------------------------------------------------------
+# État de la vue
+# --------------------------------------------------------------------------
+class View:
+    __slots__ = ("eye", "quat", "tanx", "tany", "mode")
+
+    def __init__(self, eye, quat, tanx, tany, mode):
+        self.eye, self.quat, self.tanx, self.tany, self.mode = eye, quat, tanx, tany, mode
+
+    def differs(self, other, move, angle):
+        if other is None:
+            return True
+        if (self.eye - other.eye).length >= move:
+            return True
+        if self.quat.rotation_difference(other.quat).angle >= angle:
+            return True
+        if abs(self.tanx - other.tanx) > 0.02 * other.tanx or abs(self.tany - other.tany) > 0.02 * other.tany:
+            return True
+        return self.mode != other.mode
+
+
+def _largest_view3d():
+    wm = bpy.context.window_manager
+    best, best_area = None, -1
+    for win in wm.windows:
+        for area in win.screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            r3d = area.spaces.active.region_3d
+            if r3d is None:
+                continue
+            a = area.width * area.height
+            if a > best_area:
+                best_area, best = a, r3d
+    return best
+
+
+def viewport_view():
+    r3d = _largest_view3d()
+    if r3d is None:
+        return None
+    inv = r3d.view_matrix.inverted()
+    wmx = r3d.window_matrix
+    if r3d.is_perspective and abs(wmx[0][0]) > 1e-6 and abs(wmx[1][1]) > 1e-6:
+        return View(inv.translation.copy(), inv.to_quaternion(), 1.0 / abs(wmx[0][0]), 1.0 / abs(wmx[1][1]), 1.0)
+    return View(inv.translation.copy(), inv.to_quaternion(), 1.0, 1.0, 0.0)   # ortho : pas de culling
+
+
+def camera_view(scene, frustum=True):
+    cam = scene.camera
+    if cam is None:
+        return None
+    mw = cam.matrix_world
+    tanx = tany = 1.0
+    mode = 1.0 if frustum else 0.5
+    if cam.type == "CAMERA" and cam.data.type == "PERSP":
+        r = scene.render
+        try:
+            pm = cam.calc_matrix_camera(bpy.context.evaluated_depsgraph_get(),
+                                        x=r.resolution_x, y=r.resolution_y,
+                                        scale_x=r.pixel_aspect_x, scale_y=r.pixel_aspect_y)
+            tanx, tany = 1.0 / abs(pm[0][0]), 1.0 / abs(pm[1][1])
+        except Exception:  # noqa: BLE001
+            tanx = tany = math.tan(cam.data.angle / 2)
+    elif cam.type == "CAMERA":
+        mode = 0.0
+    return View(mw.translation.copy(), mw.to_quaternion(), tanx, tany, mode)
+
+
+def current_view(scene):
+    s = scene.apx_settings
+    if s.lod_source == "CAMERA" and scene.camera is not None:
+        return camera_view(scene)
+    v = viewport_view()
+    if v is None and scene.camera is not None:
+        v = camera_view(scene)
+    return v
+
+
+def current_eye(scene):
+    v = current_view(scene)
+    return v.eye if v else None
+
+
+# --------------------------------------------------------------------------
+# Mode Empties (numpy)
+# --------------------------------------------------------------------------
 class _Cache:
     def __init__(self):
         self.valid = False
-        self.objs = []          # références aux empties
-        self.pos = None         # (N,3)
-        self.size = None        # (N,) rayon * échelle
-        self.model_idx = None   # (N,)
-        self.models = []        # [(lods[], bounds_coll|None)]
-        self.n_lods = None      # (M,)
-        self.has_bounds = None  # (M,)
-        self.current = None     # (N,) niveau actuel
-        self.last_eye = None
+        self.objs = []
+        self.pos = None
+        self.size = None
+        self.model_idx = None
+        self.models = []
+        self.n_lods = None
+        self.has_bounds = None
+        self.current = None
+        self.last_view = None
         self.forced_applied = None
 
 
@@ -37,7 +129,7 @@ _cache = _Cache()
 
 def invalidate():
     _cache.valid = False
-    _cache.last_eye = None
+    _cache.last_view = None
     _cache.forced_applied = None
 
 
@@ -69,18 +161,17 @@ def rebuild(scene):
     c.has_bounds = np.array([m[1] is not None for m in models], dtype=bool)
     c.current = np.full(len(objs), -2, dtype=np.int32)
     c.valid = True
-    c.last_eye = None
+    c.last_view = None
     c.forced_applied = None
 
 
-# --------------------------------------------------------------------------
-def _compute_levels(eye, s):
+def _compute_levels(view, s):
     c = _cache
     if len(c.objs) == 0:
         return np.zeros(0, dtype=np.int32)
-    raw = np.linalg.norm(c.pos - np.asarray(eye, dtype=np.float32), axis=1)
+    rel = c.pos - np.asarray(view.eye, dtype=np.float32)
+    raw = np.linalg.norm(rel, axis=1)
     d = raw
-    # Normalisation par la taille : un gros rocher garde son LOD0 plus loin
     if s.lod_size_scaling:
         factor = np.clip(c.size / max(s.lod_reference_size, 1e-3), 0.25, 20.0)
         d = d / factor
@@ -90,20 +181,28 @@ def _compute_levels(eye, s):
     level = np.searchsorted(thresholds, d, side="right").astype(np.int32)
     nl = c.n_lods[c.model_idx]
     level = np.minimum(level, nl - 1)
-
     if s.use_bounds_level:
         hb = c.has_bounds[c.model_idx]
         level = np.where(hb & (d >= s.bounds_distance), nl, level)
+
+    culled = np.zeros(len(level), dtype=bool)
     if s.use_culling:
-        level = np.where(d >= s.cull_distance, LEVEL_CULLED, level)
-        if s.cull_small_props:
-            # Petits objets masqués plus tôt
-            small = c.size < s.small_prop_size
-            level = np.where(small & (raw >= s.small_prop_distance), LEVEL_CULLED, level)
-    return level
+        culled |= raw >= s.cull_distance
+    if s.cull_small_props and view.mode > 0.25 and s.min_screen_pct > 0:
+        culled |= c.size / np.maximum(raw * view.tany, 1e-4) < s.min_screen_pct / 100.0
+    if s.use_frustum and view.mode > 0.75:
+        rmat = np.array(view.quat.to_matrix(), dtype=np.float32)    # colonnes = axes de la vue
+        vl = rel @ rmat                                              # coordonnées dans l'espace vue
+        fwd = -vl[:, 2]
+        m = s.frustum_margin
+        sz = c.size * 1.5
+        inside = ((np.abs(vl[:, 0]) <= fwd * view.tanx * m + sz) &
+                  (np.abs(vl[:, 1]) <= fwd * view.tany * m + sz) & (fwd >= -sz))
+        culled |= ~inside
+    return np.where(culled, LEVEL_CULLED, level)
 
 
-def _apply(levels, for_render=False):
+def _apply(levels):
     c = _cache
     changed = np.nonzero(levels != c.current)[0]
     try:
@@ -135,75 +234,48 @@ def apply_forced(scene, level):
         rebuild(scene)
     c = _cache
     if len(c.objs) == 0:
+        _cache.forced_applied = level
         return 0
     nl = c.n_lods[c.model_idx]
     levels = np.minimum(np.full(len(c.objs), level, dtype=np.int32), nl - 1)
     n = _apply(levels)
     _cache.forced_applied = level
-    _cache.last_eye = None
+    _cache.last_view = None
     return n
 
 
-def update_from_eye(scene, eye, force=False):
-    s = scene.apx_settings
+def update_empties(scene, view):
     if not _cache.valid:
         rebuild(scene)
-    c = _cache
-    if not force and c.last_eye is not None:
-        if (Vector(eye) - c.last_eye).length < s.update_move_threshold:
-            return 0
-    c.last_eye = Vector(eye)
-    c.forced_applied = None
-    return _apply(_compute_levels(eye, s))
+    _cache.forced_applied = None
+    _cache.last_view = view
+    if len(_cache.objs) == 0:
+        return 0
+    return _apply(_compute_levels(view, scene.apx_settings))
+
+
+# Compatibilité
+def update_from_eye(scene, eye, force=False):
+    v = current_view(scene) or View(Vector(eye), Quaternion(), 1.0, 1.0, 0.0)
+    v.eye = Vector(eye)
+    return update_empties(scene, v)
 
 
 # --------------------------------------------------------------------------
-# Point de vue
+# Application globale
 # --------------------------------------------------------------------------
-def viewport_eye(context=None):
-    wm = bpy.context.window_manager
-    best, best_area = None, -1
-    for win in wm.windows:
-        for area in win.screen.areas:
-            if area.type != "VIEW_3D":
-                continue
-            r3d = area.spaces.active.region_3d
-            if r3d is None:
-                continue
-            a = area.width * area.height
-            if a > best_area:
-                best_area = a
-                best = r3d.view_matrix.inverted().translation.copy()
-    return best
-
-
-def current_eye(scene):
-    s = scene.apx_settings
-    if s.lod_source == "CAMERA" and scene.camera is not None:
-        return scene.camera.matrix_world.translation.copy()
-    eye = viewport_eye()
-    if eye is None and scene.camera is not None:
-        eye = scene.camera.matrix_world.translation.copy()
-    return eye
-
-
-# --------------------------------------------------------------------------
-# Timer & handlers
-# --------------------------------------------------------------------------
-_rendering = False
-
-
 def _gn_present():
     from . import gn_instancer
     ng = bpy.data.node_groups.get(gn_instancer.GROUP)
     return ng is not None and ng.users > 0
 
 
-def _move_probe_throttled(scene, eye, s):
+def apply_view(scene, view):
     from . import gn_instancer
-    p = gn_instancer.get_probe(scene)
-    if (p.location - Vector(eye)).length >= s.update_move_threshold:
-        p.location = eye
+    n = update_empties(scene, view)
+    if _gn_present():
+        gn_instancer.set_probe(scene, view.eye, view.quat, view.tanx, view.tany, view.mode)
+    return n
 
 
 def apply_all(scene):
@@ -212,17 +284,31 @@ def apply_all(scene):
     s = scene.apx_settings
     invalidate()
     n = 0
+    if _gn_present():
+        n += gn_instancer.apply_settings(scene)
     if not s.use_lod:
         n += apply_forced(scene, s.forced_lod)
     else:
-        eye = current_eye(scene)
-        if eye is not None:
-            n += update_from_eye(scene, eye, force=True)
-            if _gn_present():
-                gn_instancer.move_probe(scene, Vector(eye))
-    if _gn_present():
-        n += gn_instancer.apply_settings(scene)
+        v = current_view(scene)
+        if v is not None:
+            n += apply_view(scene, v)
+            _state.applied = v
     return n
+
+
+# --------------------------------------------------------------------------
+# Timer (anti-rebond) & handlers
+# --------------------------------------------------------------------------
+class _State:
+    applied = None      # dernière vue appliquée
+    last_seen = None    # vue au tick précédent
+    changed_at = 0.0    # instant du dernier mouvement
+    applied_at = 0.0
+
+
+_state = _State()
+_rendering = False
+TICK = 0.1
 
 
 def _timer():
@@ -236,28 +322,41 @@ def _timer():
         if not s.use_lod:
             if _cache.forced_applied != s.forced_lod:
                 apply_forced(scene, s.forced_lod)
-            return 1.0
+            return 0.5
         if not s.lod_auto_update:
-            return 1.0
-        eye = current_eye(scene)
-        if eye is not None:
-            update_from_eye(scene, eye)
-            if _gn_present():
-                _move_probe_throttled(scene, eye, s)
+            return 0.5
+        v = current_view(scene)
+        if v is None:
+            return 0.5
+        now = time.monotonic()
+        moving = v.differs(_state.last_seen, 0.05, math.radians(0.5))
+        _state.last_seen = v
+        if moving:
+            _state.changed_at = now
+        need = v.differs(_state.applied, s.update_move_threshold, math.radians(s.update_angle_threshold))
+        if need:
+            settled = (now - _state.changed_at) >= s.update_settle
+            overdue = (now - _state.applied_at) >= s.update_interval
+            if settled or overdue:
+                apply_view(scene, v)
+                _state.applied = v
+                _state.applied_at = now
     except Exception as exc:  # noqa: BLE001
         print(f"[APX] LOD timer: {exc}")
         invalidate()
-    return max(s.update_interval, 0.05)
+    return TICK
 
 
 @bpy.app.handlers.persistent
 def _on_load(_dummy):
     invalidate()
+    _state.applied = None
 
 
 @bpy.app.handlers.persistent
 def _on_undo(_dummy):
     invalidate()
+    _state.applied = None
 
 
 @bpy.app.handlers.persistent
@@ -274,10 +373,10 @@ def _render_pre(scene, _dg=None):
             if gn:
                 gn_instancer.apply_settings(scene, force_level=level)
         elif s.render_mode == "CAMERA" and scene.camera is not None:
-            cam = scene.camera.matrix_world.translation.copy()
-            update_from_eye(scene, cam, force=True)
+            v = camera_view(scene, frustum=s.render_frustum)
+            update_empties(scene, v)
             if gn:
-                gn_instancer.move_probe(scene, cam)
+                gn_instancer.set_probe(scene, v.eye, v.quat, v.tanx, v.tany, v.mode)
     except Exception as exc:  # noqa: BLE001
         print(f"[APX] render_pre: {exc}")
 
@@ -286,8 +385,9 @@ def _render_pre(scene, _dg=None):
 def _render_post(scene, _dg=None):
     global _rendering
     _rendering = False
-    _cache.last_eye = None
+    _cache.last_view = None
     _cache.forced_applied = None
+    _state.applied = None
     try:
         if _gn_present():
             from . import gn_instancer

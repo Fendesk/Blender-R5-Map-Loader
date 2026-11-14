@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import time
 
 import bpy
@@ -8,9 +9,18 @@ from bpy.props import CollectionProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Euler, Vector
 
-from . import castfile, gn_instancer, library, lod_system, optimize, placement
+from . import castfile, gn_instancer, library, lod_system, optimize, placement, visibility, vpk
 
 PLACEMENT_EXT = (".ent", ".json", ".csv", ".mprt")
+
+
+def exclude_regex(text):
+    """Mots entiers séparés par _ / - . ou chiffres ; '*' = joker."""
+    words = [w.strip().strip("_/").lower() for w in text.split(",") if w.strip().strip("_/")]
+    if not words:
+        return None
+    parts = [re.escape(w).replace(r"\*", r"[^/]*") for w in words]
+    return re.compile(r"(?:^|[/_\-\.\d])(?:" + "|".join(parts) + r")(?=$|[/_\-\.\d])")
 
 
 def _category(model_path):
@@ -83,6 +93,7 @@ def import_map(context, paths, report=print):
     t0 = time.time()
     if context.object and context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
+    castfile.clear_image_cache()
 
     world_paths = [p for p in paths if p.lower().endswith(".cast")]
     place_paths = [p for p in paths if os.path.splitext(p)[1].lower() in PLACEMENT_EXT]
@@ -93,14 +104,44 @@ def import_map(context, paths, report=print):
                 if os.path.isfile(cand) and cand not in world_paths:
                     world_paths.append(cand)
 
+    # Entités : .vpk choisis directement, ou champ "Entités" rempli et import d'un .mprt
+    vpk_paths = [p for p in paths if p.lower().endswith(".vpk")]
+    extra = bpy.path.abspath(s.ent_path) if s.ent_path else ""
+    if extra and os.path.isfile(extra) and any(p.lower().endswith(".mprt") for p in place_paths):
+        if extra.lower().endswith(".vpk"):
+            if extra not in vpk_paths:
+                vpk_paths.append(extra)
+        elif extra not in place_paths:
+            place_paths.append(extra)
+
     # 1) Placements --------------------------------------------------------
-    placements = []
+    placements, ziplines = [], []
     for p in place_paths:
-        placements.extend(placement.load_placements(p))
+        if p.lower().endswith(".ent"):
+            with open(p, "r", encoding="utf-8", errors="replace") as f:
+                pl, zl = placement.parse_ent_text(f.read())
+            placements.extend(pl)
+            ziplines.extend(zl)
+        else:
+            placements.extend(placement.load_placements(p))
+    kinds = tuple(k.strip().lower() for k in s.ent_files.split(",") if k.strip())
+    ent_names = []
+    for vp in vpk_paths:
+        ents, skipped = vpk.read_ents(vp, kinds)
+        for name, text in ents:
+            pl, zl = placement.parse_ent_text(text)
+            placements.extend(pl)
+            ziplines.extend(zl)
+            ent_names.append(os.path.basename(name))
+            report(f"{os.path.basename(name)} : {len(pl)} props, {len(zl)} tyroliennes")
+        for sk in skipped:
+            report(f"{os.path.basename(sk)} ignoré (compressé dans le VPK)")
+    if not place_paths and ent_names:
+        place_paths = [os.path.join(os.path.dirname(vpk_paths[0]), ent_names[0])]
     total_raw = len(placements)
-    excl = [e.strip().lower() for e in s.exclude_patterns.split(",") if e.strip()]
-    if excl:
-        placements = [p for p in placements if not any(e in p.model.lower() for e in excl)]
+    excl_re = exclude_regex(s.exclude_patterns)
+    if excl_re is not None:
+        placements = [p for p in placements if not excl_re.search(p.model.lower())]
     if s.use_region:
         c = Vector(s.region_center)
         r2 = s.region_radius ** 2
@@ -155,8 +196,21 @@ def import_map(context, paths, report=print):
         if missing:
             txt = bpy.data.texts.get("APX_missing_models") or bpy.data.texts.new("APX_missing_models")
             txt.clear()
-            txt.write("\n".join(missing))
+            txt.write("Modèles introuvables dans le dossier des modèles (à exporter avec RSX) :\n")
+            paths_by_key = {}
+            for p in placements:
+                paths_by_key.setdefault(placement.model_key(p.model), p.model)
+            txt.write("\n".join(paths_by_key.get(k, k) for k in missing))
 
+    if ziplines and s.import_ziplines:
+        map_name = _map_name(place_paths[0]) if place_paths else "map"
+        map_col = _get_child_collection(scene.collection, f"APX_Map_{map_name}")
+        _create_ziplines(ziplines, map_col, map_name, unit, offset)
+
+    if s.setup_viewport_on_import:
+        optimize.setup_viewport_for_large_map()
+
+    visibility.apply(scene)
     context.view_layer.update()
     lod_system.apply_all(scene)
 
@@ -164,6 +218,26 @@ def import_map(context, paths, report=print):
            f"{', géométrie importée' if world_paths else ''} ({time.time() - t0:.1f}s)")
     report(msg)
     return created, len(available), missing
+
+
+def _create_ziplines(ziplines, map_col, map_name, unit, offset):
+    col = _get_child_collection(map_col, f"{map_name}_ziplines")
+    cu = bpy.data.curves.new(f"{map_name}_ziplines", "CURVE")
+    cu.dimensions = "3D"
+    cu.bevel_depth = 0.025
+    cu.bevel_resolution = 1
+    off = (offset.x, offset.y, offset.z)
+    for pts in ziplines:
+        sp = cu.splines.new("POLY")
+        sp.points.add(len(pts) - 1)
+        for i, p in enumerate(pts):
+            sp.points[i].co = (p[0] * unit - off[0], p[1] * unit - off[1], p[2] * unit - off[2], 1.0)
+    mat = bpy.data.materials.get("APX_zipline_cable") or bpy.data.materials.new("APX_zipline_cable")
+    mat.diffuse_color = (0.05, 0.05, 0.05, 1.0)
+    cu.materials.append(mat)
+    obj = bpy.data.objects.new(f"{map_name}_ziplines", cu)
+    col.objects.link(obj)
+    return obj
 
 
 def _xf(p, unit, offset):
@@ -227,7 +301,7 @@ class APX_OT_import_map(bpy.types.Operator, ImportHelper):
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".mprt"
-    filter_glob: StringProperty(default="*.mprt;*.cast;*.ent;*.json;*.csv", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.mprt;*.cast;*.ent;*.vpk;*.json;*.csv", options={"HIDDEN"})
     files: CollectionProperty(type=bpy.types.OperatorFileListElement, options={"HIDDEN", "SKIP_SAVE"})
     directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN"})
 
@@ -237,6 +311,8 @@ class APX_OT_import_map(bpy.types.Operator, ImportHelper):
         col.prop(s, "models_dir")
         col.label(text="(vide = dossier '_models' à côté du fichier)")
         col.prop(s, "instancing_mode")
+        col.prop(s, "ent_path")
+        col.prop(s, "ent_files")
         col.prop(s, "import_world")
         col.prop(s, "world_tile_size")
         col.prop(s, "unit_scale")
@@ -306,6 +382,45 @@ class APX_OT_optimize(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class APX_OT_texture_limit(bpy.types.Operator):
+    """Limite la résolution des textures dans le viewport (préférence Blender : Viewport > Texture Limit).
+Évite que la mémoire vidéo sature et que des textures ne s'affichent pas"""
+    bl_idname = "apx.texture_limit"
+    bl_label = "Appliquer la limite de textures"
+
+    def execute(self, context):
+        s = context.scene.apx_settings
+        context.preferences.system.gl_texture_limit = s.texture_limit
+        if hasattr(context.scene, "cycles"):
+            size = {"CLAMP_OFF": 0, "CLAMP_2048": 2048, "CLAMP_1024": 1024,
+                    "CLAMP_512": 512, "CLAMP_256": 256}[s.texture_limit]
+            try:
+                context.scene.render.use_simplify = size > 0 or context.scene.render.use_simplify
+                context.scene.cycles.texture_limit = str(size) if size else "OFF"
+            except (AttributeError, TypeError):
+                pass
+        self.report({"INFO"}, f"Limite de textures viewport : {s.texture_limit.replace('CLAMP_', '')}")
+        return {"FINISHED"}
+
+
+class APX_OT_select_group(bpy.types.Operator):
+    """Sélectionne les objets d'un groupe (triggers, outils...) visibles dans la scène"""
+    bl_idname = "apx.select_group"
+    bl_label = "Sélectionner"
+    bl_options = {"REGISTER", "UNDO"}
+
+    group: StringProperty()
+
+    def execute(self, context):
+        n = 0
+        for o in context.view_layer.objects:
+            if o.get("apx_group") == self.group and o.visible_get():
+                o.select_set(True)
+                n += 1
+        self.report({"INFO"}, f"{n} objets sélectionnés")
+        return {"FINISHED"}
+
+
 class APX_OT_viewport_setup(bpy.types.Operator):
     """Règle la distance d'affichage du viewport / caméra pour une grande map"""
     bl_idname = "apx.viewport_setup"
@@ -342,7 +457,7 @@ def menu_import(self, context):
 
 
 CLASSES = (APX_OT_import_map, APX_OT_update_lods, APX_OT_show_all, APX_OT_optimize,
-           APX_OT_viewport_setup, APX_OT_make_real)
+           APX_OT_texture_limit, APX_OT_select_group, APX_OT_viewport_setup, APX_OT_make_real)
 
 
 def register():
