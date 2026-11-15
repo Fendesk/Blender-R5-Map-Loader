@@ -52,6 +52,7 @@ GROUPS = (
     ("trigger", "Triggers"),
     ("tool", "Tool brushes (clip, blocklight, skybox...)"),
     ("fx", "Light shafts & atmosphere volumes"),
+    ("particle", "Particle / mist cards (vent mist, steam...)"),
     ("gamemode", "Game mode barriers"),
     ("dev", "Dev textures / placeholders"),
 )
@@ -61,6 +62,9 @@ _GROUP_RE = (
                         r"occluder|areaportal|hint|skip|caulk|origin_brush)($|_)")),
     ("fx", re.compile(r"godray|god_ray|lightshaft|light_shaft|volumetric|light_beam|lightbeam|sunbeam|sun_beam|"
                       r"light_cone|lightcone|(^|_)atmosphere(_|$)|(^|_)haze(_|$)|dust_motes")),
+    # Effect cards baked into props: crossed planes with a mist / steam texture that are animated particles
+    # in game (vent_climatizer_mesh_idle02 = the big mist next to the cloud-seeding climatizer vents)
+    ("particle", re.compile(r"_mesh_idle|(^|_)fog_all($|_)|(^|_)(mist|steam|smoke|vapou?r|exhaust)(_|$)")),
     ("gamemode", re.compile(r"^ar_.*(barrier|border|objective)|(^|_)(oob|out_of_bounds)($|_)")),
     # dev_*_light = light panels that are visible in game: not part of the "dev" group
     ("dev", re.compile(r"^dev_(?!.*light)|^test_|maya_test|^_default$|^default$")),
@@ -80,7 +84,7 @@ _BM_RE = re.compile(r"_bm($|_)")
 # ... which are still real overlays when their name says so
 _BM_OVERLAY_RE = re.compile(r"transparent|decal|_b2t($|_)|_bt($|_)")
 
-MAT_VERSION = 7
+MAT_VERSION = 10
 
 
 def material_group(name):
@@ -558,6 +562,9 @@ def get_material(cast, h, settings):
     x = -1100
     y = 400
 
+    if is_ice_material(name) and _build_ice(mat, nt, bsdf, cast, cm, settings):
+        return mat
+
     # Role of each texture: file names first, then the (positional) slot names
     roles, unnamed = texture_roles(cast, cm, name)
     overlay = is_overlay(name)
@@ -697,7 +704,89 @@ def get_material(cast, h, settings):
                 tex(role, True)
     if group == "fx":
         make_additive(mat)
+    elif group == "particle":
+        make_additive(mat, 0.6)     # shown on demand: a soft glowing mist instead of an opaque grey sheet
     return mat
+
+
+# --------------------------------------------------------------------------
+# Ice
+# --------------------------------------------------------------------------
+# "desertlands_ice_03_wld_dark_to_desertlands_snow_04_wld_bm" (ice spikes of Ground Zero, icicles...): the
+# albedo is a flat dark grey, the look of the ice comes from the game's ice shader. The material also holds
+# the ice colour (bluish cloudy texture, last slot), the ice normal map and a gloss mask: rebuilt as ice.
+_ICE_RE = re.compile(r"^(?:[a-z]+_)?ice_\d+")
+_ICE_COLOR = (0.66, 0.80, 0.90)
+
+
+def is_ice_material(name):
+    low = name.lower()
+    return _ICE_RE.search(low) is not None and not is_overlay(low)
+
+
+def _set_input(node, names, value):
+    for n in names:
+        if n in node.inputs:
+            node.inputs[n].default_value = value
+            return True
+    return False
+
+
+def _build_ice(mat, nt, bsdf, cast, cm, settings):
+    """Ice shader. Returns False when the textures are not the expected ones (normal material then)."""
+    slots = list(cm.slots.items())
+    if any(role_from_filename(cast.texture_path(h2)) for _s, h2 in slots):
+        roles = texture_roles(cast, cm, mat.name)[0]
+        tint_h, normal_h, gloss_h = roles.get("specular"), roles.get("normal"), roles.get("gloss")
+    elif len(slots) >= 7:
+        # two-layer layout [albedo, albedo2, normal, normal2, gloss, gloss2, ice colour]
+        tint_h, normal_h, gloss_h = slots[6][1], slots[2][1], slots[4][1]
+    else:
+        return False
+    tint_img = _image(cast.texture_path(tint_h), False) if tint_h else None
+    if tint_img is None:
+        return False
+    N, L = nt.nodes, nt.links
+    x, y = -1100, 300
+    tint = N.new("ShaderNodeTexImage"); tint.image = tint_img; tint.label = "albedo"; tint.location = (x, y)
+    # cloudy blue-grey (mean ~0.31/0.39/0.44) -> brighter, then pulled towards a light ice blue
+    hsv = N.new("ShaderNodeHueSaturation"); hsv.location = (x + 300, y)
+    hsv.inputs["Value"].default_value = 1.7
+    L.new(tint.outputs["Color"], hsv.inputs["Color"])
+    mix = N.new("ShaderNodeMix"); mix.data_type = "RGBA"; mix.location = (x + 500, y)
+    _sock(mix.inputs, "Factor_Float").default_value = 0.35
+    L.new(hsv.outputs["Color"], _sock(mix.inputs, "A_Color"))
+    _sock(mix.inputs, "B_Color").default_value = (*_ICE_COLOR, 1.0)
+    L.new(_sock(mix.outputs, "Result_Color"), bsdf.inputs["Base Color"])
+    nt.nodes.active = tint
+
+    gloss_img = _image(cast.texture_path(gloss_h), True) if gloss_h else None
+    if gloss_img is not None:
+        g = N.new("ShaderNodeTexImage"); g.image = gloss_img; g.label = "gloss"; g.location = (x, y - 300)
+        mr = N.new("ShaderNodeMapRange"); mr.location = (x + 300, y - 300)
+        mr.inputs["To Min"].default_value = 0.35    # gloss 0 (cracks)
+        mr.inputs["To Max"].default_value = 0.04    # gloss 1 (smooth ice)
+        L.new(g.outputs["Color"], mr.inputs["Value"])
+        L.new(mr.outputs["Result"], bsdf.inputs["Roughness"])
+    else:
+        bsdf.inputs["Roughness"].default_value = 0.08
+
+    normal_img = _image(cast.texture_path(normal_h), True) if normal_h else None
+    if normal_img is not None:
+        n = N.new("ShaderNodeTexImage"); n.image = normal_img; n.label = "normal"; n.location = (x, y - 600)
+        _normal_chain(nt, n, bsdf, settings.cast_flip_normal_green, (x + 300, y - 600))
+
+    bsdf.inputs["Metallic"].default_value = 0.0
+    _set_input(bsdf, ("IOR",), 1.31)
+    _set_input(bsdf, ("Specular IOR Level",), 0.6)
+    _set_input(bsdf, ("Subsurface Weight", "Subsurface"), 0.3)
+    _set_input(bsdf, ("Subsurface Radius",), (0.35, 0.65, 1.0))
+    _set_input(bsdf, ("Subsurface Scale",), 0.08)
+    _set_input(bsdf, ("Coat Weight",), 0.6)
+    _set_input(bsdf, ("Coat Roughness",), 0.03)
+    mat.diffuse_color = (*_ICE_COLOR, 1.0)
+    mat["r5_ice"] = True
+    return True
 
 
 def _normal_chain(nt, img_node, bsdf, flip_green, loc):

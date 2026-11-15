@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender R5 Map Loader",
     "author": "Fendesk",
-    "version": (0, 5, 3),
+    "version": (0, 6, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar (N) > R5 Map Loader  |  File > Import",
     "description": "Loads R5Reloaded / Apex maps (.mprt, .cast, .ent, .vpk) with instancing, switchable "

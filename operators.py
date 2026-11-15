@@ -212,6 +212,8 @@ def import_map(context, paths, report=print):
     n_poi = regions.add_zones(scene, zones, unit, offset) if zones else 0
     if sun:
         s.map_sun_json = json.dumps(sun)
+        from . import sky
+        s.sky_sun_color = sky.default_sun_color(s)
     regions.get_region(scene)
     regions.ensure_clip_modifiers(scene)
 

@@ -321,16 +321,31 @@ class _State:
 
 _state = _State()
 _rendering = False
+_render_started = 0.0
 TICK = 0.1
 
 
+def _render_running():
+    try:
+        return bpy.app.is_job_running("RENDER")
+    except (AttributeError, TypeError, ValueError):
+        return True
+
+
 def _timer():
+    global _rendering
     scene = bpy.context.scene
     if scene is None or not hasattr(scene, "r5_settings"):
         return 1.0
     s = scene.r5_settings
     if _rendering:
-        return 0.5
+        # render_post / render_cancel are not always called (crashed or aborted render, add-ons rendering
+        # in their own way): never leave the LODs frozen because of a render that is no longer running.
+        if time.monotonic() - _render_started < 2.0 or _render_running():
+            return 0.5
+        _rendering = False
+        _state.applied = None
+        _cache.last_view = None
     try:
         if not s.use_lod:
             if _cache.forced_applied != s.forced_lod:
@@ -383,8 +398,9 @@ def _on_undo(_dummy):
 
 @bpy.app.handlers.persistent
 def _render_pre(scene, _dg=None):
-    global _rendering
+    global _rendering, _render_started
     _rendering = True
+    _render_started = time.monotonic()
     s = scene.r5_settings
     from . import gn_instancer
     gn = _gn_present()

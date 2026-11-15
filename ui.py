@@ -202,14 +202,7 @@ class R5_PT_sky(_Base, bpy.types.Panel):
         s = context.scene.r5_settings
         col = self.layout.column()
         col.prop(s, "sky_mode", text="")
-        if s.sky_mode == "PROCEDURAL":
-            if s.map_sun_json:
-                col.prop(s, "sky_use_map_sun")
-            if not (s.map_sun_json and s.sky_use_map_sun):
-                col.prop(s, "sky_sun_elevation")
-                col.prop(s, "sky_sun_rotation")
-            col.prop(s, "sky_haze")
-        else:
+        if s.sky_mode != "PROCEDURAL":
             label = {"IMAGE": "Panorama", "DOME": "Dome image"}.get(s.sky_mode, "One face")
             col.prop(s, "sky_image", text=label)
             col.prop(s, "sky_image_rotation")
@@ -220,13 +213,46 @@ class R5_PT_sky(_Base, bpy.types.Panel):
             if s.sky_mode == "CUBEMAP":
                 col.prop(s, "sky_cubemap_y_up")
                 col.prop(s, "sky_panorama_width")
-            col.prop(s, "sky_add_sun")
-            if s.sky_add_sun:
-                col.prop(s, "sky_sun_elevation")
-                col.prop(s, "sky_sun_rotation")
         col.prop(s, "sky_strength")
-        col.prop(s, "sky_sun_strength")
+
+        # Sun
+        box = col.box()
+        box.prop(s, "sky_add_sun", text="Sun", icon="LIGHT_SUN")
+        if s.sky_add_sun or s.sky_mode == "PROCEDURAL":
+            if s.map_sun_json:
+                box.prop(s, "sky_use_map_sun")
+            if not (s.map_sun_json and s.sky_use_map_sun):
+                box.prop(s, "sky_sun_elevation")
+                box.prop(s, "sky_sun_rotation")
+            box.prop(s, "sky_sun_strength")
+            row = box.row(align=True)
+            row.prop(s, "sky_sun_color", text="Colour")
+            row.operator("r5.sun_color_reset", text="", icon="LOOP_BACK")
+
+        # Atmosphere (gases, dust, ozone)
+        box = col.box()
+        if s.sky_mode == "PROCEDURAL":
+            box.label(text="Atmosphere", icon="OUTLINER_DATA_VOLUME")
+        else:
+            box.prop(s, "sky_atmosphere", icon="OUTLINER_DATA_VOLUME")
+        if s.sky_mode == "PROCEDURAL" or s.sky_atmosphere:
+            if s.sky_mode != "PROCEDURAL":
+                box.prop(s, "sky_atmosphere_strength")
+            box.prop(s, "sky_air_density")
+            box.prop(s, "sky_dust_density")
+            box.prop(s, "sky_ozone_density")
+
+        # Fog
+        box = col.box()
+        box.prop(s, "sky_fog", icon="FORCE_TURBULENCE")
+        if s.sky_fog:
+            box.prop(s, "sky_fog_density")
+            box.prop(s, "sky_fog_color")
+            box.prop(s, "sky_fog_anisotropy")
+            box.prop(s, "sky_fog_distance")
+
         col.operator("r5.setup_sky", icon="WORLD_DATA")
+        col.label(text="Changes apply live once the sky is applied", icon="INFO")
         if not s.map_sun_json:
             col.label(text="The map sky/sun live in the compressed _env.ent", icon="INFO")
 

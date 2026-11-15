@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "r5_map_loader"
-version = "0.5.3"
+version = "0.6.0"
 name = "Blender R5 Map Loader"
 tagline = "Loads R5Reloaded maps with dynamic LODs, regions and Cycles"
 maintainer = "Fendesk"

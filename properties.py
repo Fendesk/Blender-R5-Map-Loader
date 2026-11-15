@@ -21,17 +21,21 @@ def _vis_changed(self, context):
 
 
 def _sky_changed(self, context):
+    """Value change: applied in place (sun, atmosphere, fog, strength, rotation)."""
     from . import sky
-    w = bpy.data.worlds.get(sky.WORLD)
-    if w is not None and w.get("r5_sky_mode") == "DOME":
-        try:
-            sky.refresh_dome(context.scene)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[R5] sky: {exc}")
-    elif w is not None and context.scene.world == w:
-        for n in w.node_tree.nodes:
-            if n.type == "BACKGROUND":
-                n.inputs["Strength"].default_value = self.sky_strength
+    try:
+        sky.update_live(context.scene)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[R5] sky: {exc}")
+
+
+def _sky_rebuild(self, context):
+    """Dome mapping change: the world nodes are rebuilt."""
+    from . import sky
+    try:
+        sky.refresh(context.scene)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[R5] sky: {exc}")
 
 
 _TEX_LIMITS = [("OFF", "No limit", ""), ("4096", "4096", ""), ("2048", "2048", ""), ("1024", "1024", ""),
@@ -47,6 +51,9 @@ class R5_Settings(bpy.types.PropertyGroup):
     hide_fx: BoolProperty(name="Hide light shafts & atmosphere", default=True, update=_vis_changed,
                           description="Godray / light shaft / atmosphere volume props. In game they are additive "
                                       "translucent effects; in Blender they show up as large ellipses / cones")
+    hide_particle: BoolProperty(name="Hide particle / mist cards", default=True, update=_vis_changed,
+                                description="Crossed planes with a mist / steam texture that are animated particles "
+                                            "in game, e.g. the big mist next to the climatizer vents")
     hide_gamemode: BoolProperty(name="Hide game mode barriers", default=True, update=_vis_changed,
                                 description="Arenas / Control walls and borders (ar_* materials)")
     hide_dev: BoolProperty(name="Hide dev textures", default=True, update=_vis_changed,
@@ -264,24 +271,58 @@ class R5_Settings(bpy.types.PropertyGroup):
         items=[("EQUIDISTANT", "Equidistant", "Distance from the centre proportional to the angle from the zenith"),
                ("EQUISOLID", "Equal area", "Fisheye keeping areas (more room near the horizon)"),
                ("ORTHO", "Planar (top view)", "Dome seen from above: the horizon is squeezed on the circle")],
-        default="EQUIDISTANT", update=_sky_changed)
+        default="EQUIDISTANT", update=_sky_rebuild)
     sky_dome_horizon: FloatProperty(
-        name="Horizon radius", default=1.0, min=0.3, max=1.5, subtype="FACTOR", update=_sky_changed,
+        name="Horizon radius", default=1.0, min=0.3, max=1.5, subtype="FACTOR", update=_sky_rebuild,
         description="Where the horizon sits in the disc. Lower it when the mountains float above the horizon, "
                     "raise it when they are cut")
-    sky_dome_mirror: BoolProperty(name="Mirror", default=False, update=_sky_changed,
+    sky_dome_mirror: BoolProperty(name="Mirror", default=False, update=_sky_rebuild,
                                   description="Flip east / west (images authored as seen from below)")
     sky_cubemap_y_up: BoolProperty(name="Faces authored Y-up", default=True,
                                    description="On for D3D / RSX cubemaps. Off for Z-up faces")
     sky_panorama_width: EnumProperty(name="Panorama width",
                                      items=[("2048", "2048", ""), ("4096", "4096", ""), ("8192", "8192", "")],
                                      default="4096")
-    sky_sun_elevation: FloatProperty(name="Sun elevation (°)", default=35.0, min=-10.0, max=90.0)
-    sky_sun_rotation: FloatProperty(name="Sun rotation (°)", default=40.0, soft_min=-180, soft_max=180)
-    sky_sun_strength: FloatProperty(name="Sun strength", default=4.0, min=0.0)
-    sky_haze: FloatProperty(name="Haze", default=1.5, min=0.0, max=10.0)
-    sky_add_sun: BoolProperty(name="Add a sun lamp", default=True)
-    sky_use_map_sun: BoolProperty(name="Use the map's sun", default=True,
+    sky_sun_elevation: FloatProperty(name="Sun elevation (°)", default=35.0, min=-10.0, max=90.0,
+                                     update=_sky_changed)
+    sky_sun_rotation: FloatProperty(name="Sun rotation (°)", default=40.0, soft_min=-180, soft_max=180,
+                                    update=_sky_changed)
+    sky_sun_strength: FloatProperty(name="Sun strength", default=4.0, min=0.0, update=_sky_changed)
+    sky_sun_color: FloatVectorProperty(
+        name="Sun colour", subtype="COLOR", size=3, min=0.0, max=1.0, default=(1.0, 0.96, 0.9),
+        update=_sky_changed, description="Colour of the sun lamp. Reset = the map's sun colour when an env .ent "
+                                         "with light_environment was loaded, otherwise warm white")
+    # Atmosphere (Blender's physical sky: same parameters as the Procedural sky)
+    sky_atmosphere: BoolProperty(
+        name="Atmosphere", default=False, update=_sky_changed,
+        description="Blend a physical atmosphere (air, dust, ozone) over the image sky, strongest towards the "
+                    "horizon")
+    sky_atmosphere_strength: FloatProperty(name="Atmosphere strength", default=0.5, min=0.0, max=1.0,
+                                           subtype="FACTOR", update=_sky_changed)
+    sky_air_density: FloatProperty(
+        name="Air (gas)", default=1.0, min=0.0, max=10.0, update=_sky_changed,
+        description="Air molecules (Rayleigh scattering): blue sky, orange sunsets")
+    sky_dust_density: FloatProperty(
+        name="Dust / haze", default=1.0, min=0.0, max=10.0, update=_sky_changed,
+        description="Dust and water droplets (Mie scattering): whitish haze and glow around the sun")
+    sky_ozone_density: FloatProperty(
+        name="Ozone", default=1.0, min=0.0, max=10.0, update=_sky_changed,
+        description="Ozone layer: absorbs orange light, deeper blue sky")
+    # Fog (volume box around the map)
+    sky_fog: BoolProperty(name="Volumetric fog", default=False, update=_sky_changed,
+                          description="Fog filling the map (a volume box around it). Heavier to render")
+    sky_fog_density: FloatProperty(
+        name="Fog density", default=0.0003, min=0.0, soft_max=0.01, precision=5, step=0.001, update=_sky_changed,
+        description="Per metre. 0.0003 = about half the light gone after 2.3 km")
+    sky_fog_color: FloatVectorProperty(name="Fog colour", subtype="COLOR", size=3, min=0.0, max=1.0,
+                                       default=(0.75, 0.82, 0.9), update=_sky_changed)
+    sky_fog_anisotropy: FloatProperty(name="Fog anisotropy", default=0.3, min=-0.9, max=0.9, update=_sky_changed,
+                                      description="> 0: the fog glows towards the sun")
+    sky_fog_distance: FloatProperty(name="Fog range (EEVEE)", default=3000.0, min=10.0, subtype="DISTANCE",
+                                    update=_sky_changed,
+                                    description="EEVEE only computes volumes up to this distance")
+    sky_add_sun: BoolProperty(name="Add a sun lamp", default=True, update=_sky_changed)
+    sky_use_map_sun: BoolProperty(name="Use the map's sun", default=True, update=_sky_changed,
                                   description="Use light_environment from an .ent file when one was loaded")
     map_sun_json: StringProperty(default="", options={"HIDDEN"})
 
