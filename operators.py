@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import re
@@ -9,13 +10,13 @@ from bpy.props import CollectionProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Euler, Vector
 
-from . import castfile, gn_instancer, library, lod_system, optimize, placement, visibility, vpk
+from . import castfile, gn_instancer, library, lod_system, optimize, placement, regions, visibility, vpk
 
 PLACEMENT_EXT = (".ent", ".json", ".csv", ".mprt")
 
 
 def exclude_regex(text):
-    """Mots entiers séparés par _ / - . ou chiffres ; '*' = joker."""
+    """Whole words separated by _ / - . or digits; '*' = wildcard."""
     words = [w.strip().strip("_/").lower() for w in text.split(",") if w.strip().strip("_/")]
     if not words:
         return None
@@ -26,7 +27,7 @@ def exclude_regex(text):
 def _category(model_path):
     p = model_path.replace("\\", "/").lower()
     if "/" not in p:
-        # .mprt : pas de dossier, on prend le préfixe du nom (desertlands_, indust_...)
+        # .mprt: no folder, use the name prefix (desertlands_, indust_...)
         return p.split("_", 1)[0] if "_" in p else "misc"
     parts = p.split("/")
     if parts[0] in ("mdl", "models"):
@@ -52,12 +53,12 @@ def _resolve_models_dir(s, paths):
         if os.path.isdir(cand):
             s.models_dir = cand
             return cand
-    raise RuntimeError("Dossier des modèles introuvable : renseigne-le dans le panneau R5 Map Loader > Import "
-                       "(pour un export Legion+, c'est le dossier '_models' à côté du .mprt)")
+    raise RuntimeError("Models folder not found: set it in the R5 Map Loader > Import panel "
+                       "(for a Legion+ export, it is the '_models' folder next to the .mprt)")
 
 
 def _offset(scene, s, centroid_fn):
-    """Décalage de recentrage en mètres, partagé entre props et géométrie."""
+    """Recentering offset in meters, shared by props and geometry."""
     if not s.recenter:
         return Vector((0, 0, 0))
     if "apx_offset" in scene:
@@ -77,14 +78,11 @@ def _map_name(path):
 def import_world(context, cast_path, report=print):
     scene = context.scene
     s = scene.apx_settings
-    unit = s.unit_scale
     name = _map_name(cast_path)
     col = _get_child_collection(scene.collection, f"APX_World_{name}")
-    # le centroïde de la géométrie n'est connu qu'après lecture : on retombe sur 0 si besoin
     off = _offset(scene, s, lambda: Vector((0, 0, 0)))
-    xf = np.eye(3) * unit
-    objs = castfile.import_world_cast(cast_path, s, col, xf, np.array(off[:], dtype=np.float64), report)
-    return objs
+    xf = np.eye(3) * s.unit_scale
+    return castfile.import_world_cast(cast_path, s, col, xf, np.array(off[:], dtype=np.float64), report)
 
 
 def import_map(context, paths, report=print):
@@ -104,7 +102,7 @@ def import_map(context, paths, report=print):
                 if os.path.isfile(cand) and cand not in world_paths:
                     world_paths.append(cand)
 
-    # Entités : .vpk choisis directement, ou champ "Entités" rempli et import d'un .mprt
+    # Entities: .vpk picked directly, or the "Entities" field filled in when loading an .mprt
     vpk_paths = [p for p in paths if p.lower().endswith(".vpk")]
     extra = bpy.path.abspath(s.ent_path) if s.ent_path else ""
     if extra and os.path.isfile(extra) and any(p.lower().endswith(".mprt") for p in place_paths):
@@ -115,13 +113,20 @@ def import_map(context, paths, report=print):
             place_paths.append(extra)
 
     # 1) Placements --------------------------------------------------------
-    placements, ziplines = [], []
+    placements, ziplines, zones, sun = [], [], [], {}
+
+    def take(data, label):
+        placements.extend(data.placements)
+        ziplines.extend(data.ziplines)
+        zones.extend(data.zones)
+        if data.sun:
+            sun.update(data.sun)
+        report(f"{label}: {len(data.placements)} props, {len(data.ziplines)} ziplines, {len(data.zones)} zones")
+
     for p in place_paths:
         if p.lower().endswith(".ent"):
             with open(p, "r", encoding="utf-8", errors="replace") as f:
-                pl, zl = placement.parse_ent_text(f.read())
-            placements.extend(pl)
-            ziplines.extend(zl)
+                take(placement.parse_ent_full(f.read()), os.path.basename(p))
         else:
             placements.extend(placement.load_placements(p))
     kinds = tuple(k.strip().lower() for k in s.ent_files.split(",") if k.strip())
@@ -129,13 +134,10 @@ def import_map(context, paths, report=print):
     for vp in vpk_paths:
         ents, skipped = vpk.read_ents(vp, kinds)
         for name, text in ents:
-            pl, zl = placement.parse_ent_text(text)
-            placements.extend(pl)
-            ziplines.extend(zl)
+            take(placement.parse_ent_full(text), os.path.basename(name))
             ent_names.append(os.path.basename(name))
-            report(f"{os.path.basename(name)} : {len(pl)} props, {len(zl)} tyroliennes")
         for sk in skipped:
-            report(f"{os.path.basename(sk)} ignoré (compressé dans le VPK)")
+            report(f"{os.path.basename(sk)} skipped (compressed in the VPK)")
     if not place_paths and ent_names:
         place_paths = [os.path.join(os.path.dirname(vpk_paths[0]), ent_names[0])]
     total_raw = len(placements)
@@ -146,8 +148,8 @@ def import_map(context, paths, report=print):
         c = Vector(s.region_center)
         r2 = s.region_radius ** 2
         placements = [p for p in placements if (Vector(p.origin) - c).length_squared <= r2]
-    if place_paths and not placements:
-        raise RuntimeError(f"Aucun prop à importer ({total_raw} lus avant filtrage)")
+    if place_paths and not placements and not world_paths:
+        raise RuntimeError(f"No prop to import ({total_raw} read before filtering)")
 
     unit = s.unit_scale
 
@@ -158,13 +160,13 @@ def import_map(context, paths, report=print):
         return Vector((0, 0, 0))
     offset = _offset(scene, s, centroid)
 
-    # 2) Géométrie de la map ----------------------------------------------
+    # 2) Map geometry ------------------------------------------------------
     for wp in world_paths:
         import_world(context, wp, report)
 
     created, available, missing = 0, {}, []
     if placements:
-        # 3) Modèles uniques ----------------------------------------------
+        # 3) Unique models ------------------------------------------------
         models_dir = _resolve_models_dir(s, place_paths)
         index = library.build_index(models_dir)
         keys = sorted({placement.model_key(p.model) for p in placements})
@@ -179,7 +181,7 @@ def import_map(context, paths, report=print):
             else:
                 missing.append(key)
             if i % 50 == 0:
-                print(f"[APX] modèles {i}/{len(keys)}")
+                print(f"[R5] models {i}/{len(keys)}")
         wm.progress_end()
         if s.dedupe_on_import:
             optimize.dedupe_materials()
@@ -196,7 +198,7 @@ def import_map(context, paths, report=print):
         if missing:
             txt = bpy.data.texts.get("APX_missing_models") or bpy.data.texts.new("APX_missing_models")
             txt.clear()
-            txt.write("Modèles introuvables dans le dossier des modèles (à exporter avec RSX) :\n")
+            txt.write("Models not found in the models folder (export them with RSX):\n")
             paths_by_key = {}
             for p in placements:
                 paths_by_key.setdefault(placement.model_key(p.model), p.model)
@@ -207,6 +209,12 @@ def import_map(context, paths, report=print):
         map_col = _get_child_collection(scene.collection, f"APX_Map_{map_name}")
         _create_ziplines(ziplines, map_col, map_name, unit, offset)
 
+    n_poi = regions.add_zones(scene, zones, unit, offset) if zones else 0
+    if sun:
+        s.map_sun_json = json.dumps(sun)
+    regions.get_region(scene)
+    regions.ensure_clip_modifiers(scene)
+
     if s.setup_viewport_on_import:
         optimize.setup_viewport_for_large_map()
 
@@ -214,8 +222,9 @@ def import_map(context, paths, report=print):
     context.view_layer.update()
     lod_system.apply_all(scene)
 
-    msg = (f"{created} props, {len(available)} modèles uniques, {len(missing)} manquants"
-           f"{', géométrie importée' if world_paths else ''} ({time.time() - t0:.1f}s)")
+    msg = (f"{created} props, {len(available)} unique models, {len(missing)} missing"
+           f"{', geometry imported' if world_paths else ''}{f', {n_poi} POIs' if n_poi else ''}"
+           f" ({time.time() - t0:.1f}s)")
     report(msg)
     return created, len(available), missing
 
@@ -232,7 +241,7 @@ def _create_ziplines(ziplines, map_col, map_name, unit, offset):
         sp.points.add(len(pts) - 1)
         for i, p in enumerate(pts):
             sp.points[i].co = (p[0] * unit - off[0], p[1] * unit - off[1], p[2] * unit - off[2], 1.0)
-    mat = bpy.data.materials.get("APX_zipline_cable") or bpy.data.materials.new("APX_zipline_cable")
+    mat = bpy.data.materials.get("R5_zipline_cable") or bpy.data.materials.new("R5_zipline_cable")
     mat.diffuse_color = (0.05, 0.05, 0.05, 1.0)
     cu.materials.append(mat)
     obj = bpy.data.objects.new(f"{map_name}_ziplines", cu)
@@ -242,7 +251,7 @@ def _create_ziplines(ziplines, map_col, map_name, unit, offset):
 
 def _xf(p, unit, offset):
     pitch, yaw, roll = (math.radians(a) for a in p.angles)
-    # Source/Apex : R = Rz(yaw) * Ry(pitch) * Rx(roll)  ==  Euler XYZ de Blender (roll, pitch, yaw)
+    # Source/Apex: R = Rz(yaw) * Ry(pitch) * Rx(roll)  ==  Blender XYZ Euler (roll, pitch, yaw)
     loc = (p.origin[0] * unit - offset.x, p.origin[1] * unit - offset.y, p.origin[2] * unit - offset.z)
     return loc, (roll, pitch, yaw), p.scale
 
@@ -295,9 +304,9 @@ def _instances_empty(placements, available, map_col, map_name, unit, offset, s):
 
 # --------------------------------------------------------------------------
 class APX_OT_import_map(bpy.types.Operator, ImportHelper):
-    """Charge une map R5 / Apex : placements (.mprt/.ent/.vpk/.json/.csv) et/ou géométrie (.cast)"""
+    """Load an R5 / Apex map: placements (.mprt/.ent/.vpk/.json/.csv) and/or geometry (.cast)"""
     bl_idname = "apx.import_map"
-    bl_label = "Charger une map R5"
+    bl_label = "Load R5 map"
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".mprt"
@@ -309,12 +318,12 @@ class APX_OT_import_map(bpy.types.Operator, ImportHelper):
         s = context.scene.apx_settings
         col = self.layout.column()
         col.prop(s, "models_dir")
-        col.label(text="(vide = dossier '_models' à côté du fichier)")
+        col.label(text="(empty = '_models' folder next to the file)")
         col.prop(s, "instancing_mode")
         col.prop(s, "ent_path")
         col.prop(s, "ent_files")
         col.prop(s, "import_world")
-        col.prop(s, "world_tile_size")
+        col.prop(s, "world_split")
         col.prop(s, "unit_scale")
         col.prop(s, "axis_correction")
         col.prop(s, "use_lod")
@@ -335,25 +344,25 @@ class APX_OT_import_map(bpy.types.Operator, ImportHelper):
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         if missing:
-            self.report({"WARNING"}, f"{len(missing)} modèles introuvables : voir le texte 'APX_missing_models'")
+            self.report({"WARNING"}, f"{len(missing)} models not found: see the 'APX_missing_models' text")
         return {"FINISHED"}
 
 
 class APX_OT_update_lods(bpy.types.Operator):
-    """Recalcule immédiatement les LODs"""
+    """Recompute the LODs now"""
     bl_idname = "apx.update_lods"
-    bl_label = "Mettre à jour les LODs"
+    bl_label = "Update LODs"
 
     def execute(self, context):
         n = lod_system.apply_all(context.scene)
-        self.report({"INFO"}, f"{n} éléments mis à jour")
+        self.report({"INFO"}, f"{n} items updated")
         return {"FINISHED"}
 
 
 class APX_OT_show_all(bpy.types.Operator):
-    """Affiche tous les props en LOD0 (annule le culling)"""
+    """Show every prop in LOD0 (cancels culling and auto update)"""
     bl_idname = "apx.show_all"
-    bl_label = "Tout afficher en LOD0"
+    bl_label = "Show everything in LOD0"
 
     def execute(self, context):
         s = context.scene.apx_settings
@@ -361,125 +370,14 @@ class APX_OT_show_all(bpy.types.Operator):
         lod_system.rebuild(context.scene)
         n = lod_system.apply_forced(context.scene, 0)
         n += gn_instancer.apply_settings(context.scene, force_level=0)
-        self.report({"INFO"}, f"{n} éléments en LOD0 (mise à jour auto désactivée)")
-        return {"FINISHED"}
-
-
-class APX_OT_optimize(bpy.types.Operator):
-    """Dédoublonne matériaux/images, fusionne les sommets et purge les données orphelines"""
-    bl_idname = "apx.optimize"
-    bl_label = "Optimiser la scène"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        s = context.scene.apx_settings
-        m = optimize.dedupe_materials()
-        i = optimize.dedupe_images()
-        v = optimize.merge_library_vertices(s.merge_distance) if s.merge_distance > 0 else 0
-        p = optimize.purge_orphans()
-        lod_system.invalidate()
-        self.report({"INFO"}, f"Matériaux fusionnés: {m}, images: {i}, sommets: {v}, données purgées: {p}")
-        return {"FINISHED"}
-
-
-class APX_OT_copy_map(bpy.types.Operator):
-    """Copie l'export de la map (mprt, cast, modèles, textures) vers un autre disque, sans les textures en
-double (World's Edge : ~10 Go au lieu de ~49 Go). À faire avant l'import, de préférence vers un SSD"""
-    bl_idname = "apx.copy_map"
-    bl_label = "Copier la map sans doublons…"
-
-    directory: StringProperty(subtype="DIR_PATH")
-
-    def invoke(self, context, event):
-        context.window_manager.fileselect_add(self)
-        return {"RUNNING_MODAL"}
-
-    def execute(self, context):
-        from . import transfer
-        s = context.scene.apx_settings
-        src = bpy.path.abspath(s.copy_source) if s.copy_source else ""
-        if not src and s.models_dir:
-            src = os.path.dirname(os.path.normpath(bpy.path.abspath(s.models_dir)))
-        if not src or not os.path.isdir(src):
-            self.report({"ERROR"}, "Indique le dossier source (celui qui contient le .mprt et _models)")
-            return {"CANCELLED"}
-        dst = os.path.join(self.directory, os.path.basename(os.path.normpath(src)))
-        if os.path.normpath(dst).lower().startswith(os.path.normpath(src).lower()):
-            self.report({"ERROR"}, "La destination ne peut pas être dans le dossier source")
-            return {"CANCELLED"}
-        wm = context.window_manager
-        wm.progress_begin(0, 1000)
-        try:
-            nf, nt, total = transfer.copy_map(src, dst, max_size=int(s.copy_max_texture),
-                                              progress=lambda f: wm.progress_update(int(f * 1000)),
-                                              blender=bpy.app.binary_path)
-        except (OSError, RuntimeError) as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        finally:
-            wm.progress_end()
-        new_models = os.path.join(dst, "_models")
-        if os.path.isdir(new_models):
-            s.models_dir = new_models
-        s.copy_source = ""
-        self.report({"INFO"}, f"Copié vers {dst} : {nf} fichiers + {nt} textures uniques. "
-                              f"Importe maintenant le .mprt depuis ce dossier.")
-        return {"FINISHED"}
-
-
-class APX_OT_texture_limit(bpy.types.Operator):
-    """Limite la résolution des textures dans le viewport (préférence Blender : Viewport > Texture Limit).
-Évite que la mémoire vidéo sature et que des textures ne s'affichent pas"""
-    bl_idname = "apx.texture_limit"
-    bl_label = "Appliquer la limite de textures"
-
-    def execute(self, context):
-        s = context.scene.apx_settings
-        context.preferences.system.gl_texture_limit = s.texture_limit
-        if hasattr(context.scene, "cycles"):
-            size = {"CLAMP_OFF": 0, "CLAMP_2048": 2048, "CLAMP_1024": 1024,
-                    "CLAMP_512": 512, "CLAMP_256": 256}[s.texture_limit]
-            try:
-                context.scene.render.use_simplify = size > 0 or context.scene.render.use_simplify
-                context.scene.cycles.texture_limit = str(size) if size else "OFF"
-            except (AttributeError, TypeError):
-                pass
-        self.report({"INFO"}, f"Limite de textures viewport : {s.texture_limit.replace('CLAMP_', '')}")
-        return {"FINISHED"}
-
-
-class APX_OT_select_group(bpy.types.Operator):
-    """Sélectionne les objets d'un groupe (triggers, outils...) visibles dans la scène"""
-    bl_idname = "apx.select_group"
-    bl_label = "Sélectionner"
-    bl_options = {"REGISTER", "UNDO"}
-
-    group: StringProperty()
-
-    def execute(self, context):
-        n = 0
-        for o in context.view_layer.objects:
-            if o.get("apx_group") == self.group and o.visible_get():
-                o.select_set(True)
-                n += 1
-        self.report({"INFO"}, f"{n} objets sélectionnés")
-        return {"FINISHED"}
-
-
-class APX_OT_viewport_setup(bpy.types.Operator):
-    """Règle la distance d'affichage du viewport / caméra pour une grande map"""
-    bl_idname = "apx.viewport_setup"
-    bl_label = "Régler le viewport (grande map)"
-
-    def execute(self, context):
-        optimize.setup_viewport_for_large_map()
+        self.report({"INFO"}, f"{n} items in LOD0 (auto update disabled)")
         return {"FINISHED"}
 
 
 class APX_OT_make_real(bpy.types.Operator):
-    """Convertit les instances sélectionnées (mode Empties) en vrais objets"""
+    """Turn the selected instances (Empties mode) into real objects"""
     bl_idname = "apx.make_real"
-    bl_label = "Rendre réel (sélection)"
+    bl_label = "Make real (selection)"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -501,8 +399,7 @@ def menu_import(self, context):
     self.layout.operator(APX_OT_import_map.bl_idname, text="R5 Map Loader (.mprt/.cast/.ent/.vpk)")
 
 
-CLASSES = (APX_OT_import_map, APX_OT_update_lods, APX_OT_show_all, APX_OT_optimize,
-           APX_OT_copy_map, APX_OT_texture_limit, APX_OT_select_group, APX_OT_viewport_setup, APX_OT_make_real)
+CLASSES = (APX_OT_import_map, APX_OT_update_lods, APX_OT_show_all, APX_OT_make_real)
 
 
 def register():

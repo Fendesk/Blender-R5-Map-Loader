@@ -1,24 +1,25 @@
-"""Lecteur du format Cast (exports RSX et Legion+) en pur Python + numpy.
+"""Cast file reader (RSX and Legion+ exports), pure Python + numpy.
 
-Aucun addon externe requis. Lit les nœuds modl / mesh / matl / file ;
-les squelettes et poids sont ignorés (props statiques).
+No external add-on is required. Reads the modl / mesh / matl / file nodes;
+skeletons and weights are ignored (static props).
 
-- RSX : un seul .cast peut contenir plusieurs nœuds modl "<nom>_LOD<i>" -> un objet par LOD.
-- Textures : rôle déduit du nom de fichier (…_albedoTexture, …_col, …_nml, …_gls…)
-  puis du slot ; un même fichier copié dans plusieurs dossiers n'est chargé qu'une fois.
-- Surcouches (décals, _b2t, _bt…) décalées le long des normales -> pas de z-fighting.
-- Faces des matériaux outils (triggers, clip, blocklight…) séparées dans des objets
-  marqués "apx_group" pour pouvoir les cacher.
+- RSX: a single .cast can hold several modl nodes "<name>_LOD<i>" -> one object per LOD.
+- Textures: the role is taken from the file name (..._albedoTexture, ..._col, ..._nml, ..._gls...)
+  then from the slot name; a file copied into several folders is only loaded once.
+- Overlays (decals, _b2t, _bt...) are pushed along their normals -> no z-fighting.
+- Faces using tool materials (triggers, clip, blocklight...) go to separate objects tagged
+  "r5_group" so they can be hidden.
 """
 
 import os
 import re
 import struct
+import time
 
 import bpy
 import numpy as np
 
-# id de propriété -> (dtype numpy, composantes)
+# property id -> (numpy dtype, components)
 _PROP = {
     0x62: ("<u1", 1),   # b
     0x68: ("<u2", 1),   # h
@@ -41,23 +42,32 @@ def _tag(s):
 
 T_ROOT, T_MODL, T_MESH, T_MATL, T_FILE = (_tag(t) for t in ("root", "modl", "mesh", "matl", "file"))
 
+# Custom property names (kept from older versions so existing .blend files keep working)
+GROUP_KEY = "apx_group"
+
 # --------------------------------------------------------------------------
-# Classification des matériaux par nom
+# Material / model classification by name
 # --------------------------------------------------------------------------
 GROUPS = (
     ("trigger", "Triggers"),
-    ("tool", "Brushes outils (clip, blocklight, skybox…)"),
-    ("gamemode", "Barrières de mode de jeu"),
-    ("dev", "Textures dev / placeholders"),
+    ("tool", "Tool brushes (clip, blocklight, skybox...)"),
+    ("fx", "Light shafts & atmosphere volumes"),
+    ("gamemode", "Game mode barriers"),
+    ("dev", "Dev textures / placeholders"),
 )
 _GROUP_RE = (
     ("trigger", re.compile(r"(^|_)tools?_?trigger|trigger|fogvolume|^tools_?fog")),
     ("tool", re.compile(r"^tools|^tool_|(^|_)(nodraw|playerclip|npcclip|clip|invisible|skybox|blocklight|"
                         r"occluder|areaportal|hint|skip|caulk|origin_brush)($|_)")),
+    ("fx", re.compile(r"godray|god_ray|lightshaft|light_shaft|volumetric|light_beam|lightbeam|sunbeam|sun_beam|"
+                      r"light_cone|lightcone|(^|_)atmosphere(_|$)|(^|_)haze(_|$)|dust_motes")),
     ("gamemode", re.compile(r"^ar_.*(barrier|border|objective)|(^|_)(oob|out_of_bounds)($|_)")),
-    # dev_*_light = panneaux lumineux visibles en jeu : exclus du groupe "dev"
+    # dev_*_light = light panels that are visible in game: not part of the "dev" group
     ("dev", re.compile(r"^dev_(?!.*light)|^test_|maya_test|^_default$|^default$")),
 )
+# Whole models that are light shafts / atmosphere volumes (opaque ellipses/cones in Blender)
+FX_MODEL_RE = re.compile(r"godray|god_ray|(^|_)atmosphere(_|$)|lightshaft|light_shaft|volumetric|light_beam|"
+                         r"sunbeam|sun_beam|light_cone|fog_volume|fogvolume|dust_motes")
 _OVERLAY_RE = re.compile(r"_b2t($|_)|_bt($|_)|transparent|decal|(^|_)dcl|overlay|stencil|grime|graffiti|puddle|"
                          r"stain|drip|splatter|(^|_)cracks?($|_)|(^|_)burn_|sticker|_ovl($|_)")
 _VCTINT_RE = re.compile(r"_vc($|_)|vert_?colou?r|_vcolor|_vt($|_)")
@@ -65,8 +75,7 @@ _CUTOUT_RE = re.compile(r"(?:^|[_\-\s\d])(?:leaf|leaves|foliage|grass|fern|bush|
                         r"moss_clump|flower|weed|fence|chainlink|chain_link|grate|grating|net|alpha|cutout|hair|"
                         r"fx|glass)")
 
-
-MAT_VERSION = 5
+MAT_VERSION = 6
 
 
 def material_group(name):
@@ -75,6 +84,10 @@ def material_group(name):
         if rx.search(low):
             return g
     return None
+
+
+def is_fx_model(key):
+    return FX_MODEL_RE.search(key.lower()) is not None
 
 
 def is_overlay(name):
@@ -86,13 +99,14 @@ def is_vctint(name):
 
 
 # --------------------------------------------------------------------------
-# Lecture
+# Reading
 # --------------------------------------------------------------------------
 POOL_DIR = "_shared_textures"
-_pools = {}       # dossier de départ -> index {nom_minuscule: chemin} (ou None)
+_pools = {}       # start folder -> {lowercase file name: path} (or None)
 
 
 def _pool_lookup(start_dir, name):
+    """Textures gathered in a "_shared_textures" folder (de-duplicated copy of a map)."""
     idx = _pools.get(start_dir, False)
     if idx is False:
         idx = None
@@ -121,8 +135,7 @@ def _pool_lookup(start_dir, name):
 
 
 def _read_file(path, tries=4):
-    """Lecture avec nouvel essai : un disque externe / en veille peut renvoyer une erreur passagère."""
-    import time
+    """Read with retries: an external / sleeping drive can return transient errors."""
     last = None
     for i in range(tries):
         try:
@@ -158,14 +171,14 @@ class CastFile:
         self.path = path
         self.dir = os.path.dirname(path)
         self.meshes = []
-        self.models = []      # noms des nœuds modl (RSX : "<nom>_LOD<i>")
+        self.models = []      # modl node names (RSX: "<name>_LOD<i>")
         self.materials = {}   # hash -> CastMaterial
-        self.files = {}       # hash -> chemin
+        self.files = {}       # hash -> path
         self._cur_modl = 0
         self._buf = _read_file(path)
         magic, _ver, roots, _flags = struct.unpack_from("<4sIII", self._buf, 0)
         if magic != b"cast":
-            raise ValueError(f"{path} n'est pas un fichier Cast")
+            raise ValueError(f"{path} is not a Cast file")
         off = 16
         for _ in range(roots):
             off = self._node(off)
@@ -233,7 +246,7 @@ class CastFile:
 
     def mat_name(self, h):
         cm = self.materials.get(h)
-        return cm.name if cm else "apx_default"
+        return cm.name if cm else "r5_default"
 
     def texture_path(self, h):
         p = self.files.get(h)
@@ -243,14 +256,13 @@ class CastFile:
         p = p if os.path.isabs(p) else os.path.join(self.dir, p)
         if os.path.isfile(p):
             return p
-        # RSX : la référence peut ne pas avoir d'extension, ou l'export être en .dds/.tga
+        # RSX: the reference may have no extension, or the export may be .dds/.tga
         base = os.path.splitext(p)[0]
         for ext in (".png", ".dds", ".tga", ".PNG", ".DDS"):
             if os.path.isfile(base + ext):
                 return base + ext
             if os.path.isfile(p + ext):
                 return p + ext
-        # Map copiée « sans doublons » : textures regroupées dans un dossier _shared_textures
         pooled = _pool_lookup(self.dir, os.path.basename(p))
         return pooled or p
 
@@ -263,7 +275,7 @@ class CastFile:
 # Textures
 # --------------------------------------------------------------------------
 _ROLE_KEYS = (
-    # (motif en fin de nom / nom de slot, rôle). Ordre = priorité.
+    # (pattern at the end of the file name / slot name, role). Order = priority.
     ("albedotexture", "albedo"), ("diffusetexture", "albedo"), ("basecolor", "albedo"),
     ("normal2texture", "normal2"), ("detailnormaltexture", "detailnormal"),
     ("normaltexture", "normal"), ("glosstexture", "gloss"), ("speculartexture", "specular"),
@@ -272,7 +284,7 @@ _ROLE_KEYS = (
     ("illumtexture", "emissive"), ("opacitymultiplytexture", "opacity"), ("opacitytexture", "opacity"),
     ("layerblendtexture", "layerblend"),
 )
-# Suffixes courts RSX (s_TextureTypeMap)
+# RSX short suffixes (s_TextureTypeMap)
 _SHORT = {"col": "albedo", "nml": "normal", "spc": "specular", "gls": "gloss", "ao": "ao", "cav": "cavity",
           "ehl": "emissive", "ehm": "emissivemul", "ilm": "emissive", "opa": "opacity", "msk": "mask",
           "det": "detail", "tnt": "tint", "sctr": "scatter", "thk": "thickness"}
@@ -280,8 +292,8 @@ _SLOT = {"albedo": "albedo", "diffuse": "albedo", "color": "albedo", "normal": "
          "specular": "specular", "spec": "specular", "ao": "ao", "cavity": "cavity", "emissive": "emissive",
          "emission": "emissive", "opacity": "opacity", "roughness": "roughness", "metallic": "metallic",
          "metal": "metallic"}
-# Mots ENTIERS du nom de matériau indiquant un vrai émissif (Legion+ met souvent l'AO dans le slot
-# "emissive" : "rock_lava_*" = roche volcanique, pas de la lave qui brille).
+# WHOLE words of a material name that indicate a real emissive (Legion+ often puts the AO in the
+# "emissive" slot: "rock_lava_*" is volcanic rock, not glowing lava).
 _EMISSIVE_WORDS = {"light", "lights", "lamp", "lamps", "screen", "screens", "emissive", "emis", "glow", "neon",
                    "holo", "led", "leds", "monitor", "illum", "lit", "lightstrip"}
 _EMISSIVE_RE = re.compile(r"lava_(river|flow|fall|pool|stream)|magma|molten")
@@ -291,7 +303,7 @@ def role_from_filename(path):
     if not path:
         return None
     stem = os.path.splitext(os.path.basename(path))[0].lower()
-    stem = re.sub(r"_(\d{3}|level\d+)$", "", stem)   # tableaux / mips RSX
+    stem = re.sub(r"_(\d{3}|level\d+)$", "", stem)   # RSX arrays / mips
     for key, role in _ROLE_KEYS:
         if stem.endswith(key) or ("_" + key) in stem:
             return role
@@ -313,7 +325,7 @@ def _png_has_alpha(path):
         with open(path, "rb") as f:
             head = f.read(33)
         if head[:8] != b"\x89PNG\r\n\x1a\n":
-            return True   # dds/tga : on suppose qu'il peut y avoir de l'alpha
+            return True   # dds/tga: assume there may be alpha
         return head[25] in (4, 6)
     except OSError:
         return False
@@ -327,7 +339,7 @@ def clear_image_cache():
 
 
 def _image(path, non_color):
-    """Charge une image une seule fois même si elle est copiée dans plusieurs dossiers."""
+    """Load an image only once, even if it is copied into several folders."""
     if not path or not os.path.isfile(path):
         return None
     try:
@@ -337,7 +349,7 @@ def _image(path, non_color):
     img = _img_cache.get(key)
     if img is not None:
         try:
-            img.name  # noqa: B018  (référence encore valide ?)
+            img.name  # noqa: B018  (still valid?)
             return img
         except ReferenceError:
             pass
@@ -355,11 +367,11 @@ def _image(path, non_color):
 
 
 # --------------------------------------------------------------------------
-# Matériaux
+# Materials
 # --------------------------------------------------------------------------
 def _sock(sockets, identifier):
-    """Le nœud Mix a plusieurs sockets nommés « A »/« B »/« Result » (float, vecteur, couleur) :
-    on choisit par identifiant, sinon le lien part sur un socket désactivé et est ignoré."""
+    """The Mix node has several sockets named "A"/"B"/"Result" (float, vector, color):
+    pick by identifier, otherwise the link goes to a disabled socket and is ignored."""
     for sk in sockets:
         if sk.identifier == identifier:
             return sk
@@ -388,25 +400,64 @@ def _set_render_method(mat, method):
             pass
 
 
+def _reset_tree(mat):
+    nt = mat.node_tree
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (300, 0)
+    b = nt.nodes.new("ShaderNodeBsdfPrincipled")
+    nt.links.new(b.outputs[0], out.inputs["Surface"])
+    return b
+
+
+def make_additive(mat, strength=1.0):
+    """Turn a material into an additive light effect (transparent + emission), the way light
+    shafts / atmosphere volumes are drawn in game. Works in EEVEE and Cycles."""
+    if mat is None or mat.get("r5_additive"):
+        return
+    mat.use_nodes = True
+    nt = mat.node_tree
+    img_node = next((n for n in nt.nodes if n.type == "TEX_IMAGE" and n.label == "albedo"), None)
+    img = img_node.image if img_node else None
+    nt.nodes.clear()
+    out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (600, 0)
+    add = nt.nodes.new("ShaderNodeAddShader"); add.location = (400, 0)
+    tr = nt.nodes.new("ShaderNodeBsdfTransparent"); tr.location = (200, 100)
+    em = nt.nodes.new("ShaderNodeEmission"); em.location = (200, -100)
+    em.inputs["Strength"].default_value = strength
+    if img is not None:
+        t = nt.nodes.new("ShaderNodeTexImage"); t.image = img; t.label = "albedo"; t.location = (-300, -100)
+        mul = nt.nodes.new("ShaderNodeMath"); mul.operation = "MULTIPLY"; mul.location = (0, -250)
+        nt.links.new(t.outputs["Color"], em.inputs["Color"])
+        nt.links.new(t.outputs["Alpha"], mul.inputs[0])
+        mul.inputs[1].default_value = strength
+        nt.links.new(mul.outputs[0], em.inputs["Strength"])
+        nt.nodes.active = t
+    nt.links.new(tr.outputs[0], add.inputs[0])
+    nt.links.new(em.outputs[0], add.inputs[1])
+    nt.links.new(add.outputs[0], out.inputs["Surface"])
+    _set_render_method(mat, "BLENDED")
+    mat.use_backface_culling = False
+    if hasattr(mat, "use_transparent_shadow"):
+        mat.use_transparent_shadow = True
+    mat["r5_additive"] = True
+
+
 def get_material(cast, h, settings):
     cm = cast.materials.get(h)
-    name = cm.name if cm else "apx_default"
+    name = cm.name if cm else "r5_default"
     mat = bpy.data.materials.get(name)
     if mat is not None and mat.get("apx_cast") == MAT_VERSION:
         return mat
     if mat is None:
         mat = bpy.data.materials.new(name)
     elif mat.use_nodes and mat.node_tree:
-        # Matériau d'une ancienne version de l'addon : on le reconstruit sur place
-        nt0 = mat.node_tree
-        nt0.nodes.clear()
-        out = nt0.nodes.new("ShaderNodeOutputMaterial"); out.location = (300, 0)
-        b = nt0.nodes.new("ShaderNodeBsdfPrincipled")
-        nt0.links.new(b.outputs[0], out.inputs["Surface"])
+        _reset_tree(mat)      # material from an older add-on version: rebuilt in place
+        if "r5_additive" in mat:
+            del mat["r5_additive"]
     mat["apx_cast"] = MAT_VERSION
     group = material_group(name)
     if group:
-        mat["apx_group"] = group
+        mat[GROUP_KEY] = group
         mat.diffuse_color = (1.0, 0.5, 0.0, 0.35)
     if cm is None or not settings.cast_load_textures:
         return mat
@@ -419,8 +470,7 @@ def get_material(cast, h, settings):
     x = -1100
     y = 400
 
-    # Rôle de chaque texture : nom de fichier d'abord (Legion+ range l'AO dans "emissive"),
-    # puis nom du slot.
+    # Role of each texture: file name first (Legion+ puts the AO in "emissive"), then slot name
     roles = {}
     for slot, h2 in cm.slots.items():
         p = cast.texture_path(h2)
@@ -454,8 +504,7 @@ def get_material(cast, h, settings):
 
     alb, alb_path = tex("albedo", False)
     if alb is not None:
-        # Mode Solid > Texture de Blender : affiche le nœud image actif -> l'albedo
-        nt.nodes.active = alb
+        nt.nodes.active = alb       # Solid > Texture shading shows the active image node
     spec, _ = tex("specular", False)
     base_out = alb.outputs["Color"] if alb else None
     if base_out is not None and vctint and col_attr is not None:
@@ -465,17 +514,16 @@ def get_material(cast, h, settings):
         links.new(col_attr.outputs["Color"], _sock(mul.inputs, "B_Color"))
         base_out = _sock(mul.outputs, "Result_Color")
     if base_out is not None and spec and settings.cast_spec_to_metal:
-        # Spéculaire/gloss -> métal/rugosité : une spec claire = métal, sa couleur devient la couleur de base
+        # Specular/gloss -> metal/roughness. Only a very bright specular (F0 > ~0.45) is a real metal;
+        # below that the surface stays dielectric, otherwise rocks/concrete get iridescent reflections.
         bw = nt.nodes.new("ShaderNodeRGBToBW"); bw.location = (x + 300, y + 150)
         links.new(spec.outputs["Color"], bw.inputs[0])
-        # Seule une spéculaire très claire (F0 > ~0.45) est un vrai métal ; en dessous on reste diélectrique,
-        # sinon les rochers/bétons prennent des reflets irisés.
         mr = nt.nodes.new("ShaderNodeMapRange"); mr.location = (x + 460, y + 150)
         mr.inputs["From Min"].default_value = 0.45
         mr.inputs["From Max"].default_value = 0.75
         links.new(bw.outputs[0], mr.inputs["Value"])
         if "Specular IOR Level" in bsdf.inputs:
-            # F0 diélectrique : 0.04 -> niveau 0.5 (valeur par défaut de Principled)
+            # Dielectric F0: 0.04 -> level 0.5 (Principled default)
             lv = nt.nodes.new("ShaderNodeMapRange"); lv.location = (x + 460, y - 50)
             lv.inputs["From Min"].default_value = 0.0
             lv.inputs["From Max"].default_value = 0.08
@@ -490,11 +538,11 @@ def get_material(cast, h, settings):
     elif base_out is not None:
         links.new(base_out, bsdf.inputs["Base Color"])
 
-    # Transparence
+    # Transparency
     mode = settings.cast_alpha_mode
     if alb and mode != "NEVER":
         if overlay:
-            # Surcouche : alpha texture x alpha des couleurs de sommet, mélange doux
+            # Overlay: texture alpha x vertex color alpha, smooth blending
             a = alb.outputs["Alpha"]
             if col_attr is not None:
                 m = nt.nodes.new("ShaderNodeMath"); m.operation = "MULTIPLY"; m.location = (x + 300, y + 600)
@@ -504,7 +552,7 @@ def get_material(cast, h, settings):
             _set_render_method(mat, "BLENDED")
             mat.use_backface_culling = True
         elif (mode == "ALWAYS" or _CUTOUT_RE.search(name.lower())) and _png_has_alpha(alb_path):
-            # Découpe nette (alpha clip) : pas de bruit/scintillement en viewport
+            # Hard cutout (alpha clip): no noise / flickering in the viewport
             clip = nt.nodes.new("ShaderNodeMath"); clip.operation = "GREATER_THAN"; clip.location = (x + 300, y + 600)
             clip.inputs[1].default_value = 0.5
             links.new(alb.outputs["Alpha"], clip.inputs[0])
@@ -542,11 +590,13 @@ def get_material(cast, h, settings):
         for role in roles:
             if role not in ("albedo", "normal", "gloss", "emissive", "opacity", "specular", "roughness"):
                 tex(role, True)
+    if group == "fx":
+        make_additive(mat)
     return mat
 
 
 def _normal_chain(nt, img_node, bsdf, flip_green, loc):
-    """Normal map Apex : canaux RG uniquement (BC5), B reconstruit, vert DirectX optionnellement inversé."""
+    """Apex normal maps: RG channels only (BC5), B rebuilt, DirectX green optionally flipped."""
     N, L = nt.nodes, nt.links
     x, y = loc
     sep = N.new("ShaderNodeSeparateColor"); sep.location = (x, y)
@@ -587,10 +637,10 @@ def _normal_chain(nt, img_node, bsdf, flip_green, loc):
 
 
 # --------------------------------------------------------------------------
-# Construction de mesh
+# Mesh building
 # --------------------------------------------------------------------------
 def detect_flip(cast, sample=4000):
-    """Compare l'ordre des sommets aux normales stockées pour choisir le sens des faces."""
+    """Compare the vertex order with the stored normals to pick the face winding."""
     score, n = 0.0, 0
     for m in cast.meshes:
         if m.nrm is None:
@@ -607,7 +657,7 @@ def detect_flip(cast, sample=4000):
 
 
 def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
-    """Fusionne `meshes` (CastMesh) en un seul mesh Blender. xf : matrice 3x3 (échelle+rotation)."""
+    """Merge `meshes` (CastMesh) into one Blender mesh. xf: 3x3 matrix (scale + rotation)."""
     pos_l, nrm_l, uv_l, col_l, tri_l, mat_l = [], [], [], [], [], []
     slots, slot_of = [], {}
     need_col = False
@@ -630,7 +680,7 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
         has_n = m.nrm is not None and len(m.nrm) == nv
         pos = m.pos
         if off > 0 and has_n and is_overlay(mname):
-            # Décale la surcouche au-dessus de la surface -> plus de z-fighting
+            # Push the overlay above the surface -> no z-fighting
             k = 1.0 + (m.mat % 4) * 0.25
             pos = pos.astype(np.float64) + m.nrm.astype(np.float64) * (off * k)
         pos_l.append(pos)
@@ -640,8 +690,8 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
         if m.vc is not None:
             vc = m.vc.view(np.uint8).reshape(-1, 4)
             if vc[:, 3].max() == 0 or vc[:, :3].max() < 10:
-                # Données inutilisées par ce mesh (alpha tout à 0 / RGB noir) : sinon le décal devient
-                # invisible ou la teinte noire en mode Rendered
+                # Unused data for this mesh (alpha all 0 / black RGB): otherwise the decal becomes
+                # invisible or the tint black in Rendered mode
                 vc = vc.copy()
                 if vc[:, 3].max() == 0:
                     vc[:, 3] = 255
@@ -668,7 +718,7 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
     lcol = np.concatenate(col_l) if need_col else None
     fmat = np.concatenate(mat_l)
 
-    # Soudure des sommets (les exports de map sont non indexés)
+    # Weld vertices (map exports are not indexed)
     if settings.cast_weld > 0:
         key = np.round(pos / (settings.cast_weld * max(abs(xf[0, 0]), 1e-9))).astype(np.int64)
         _u, first, inv = np.unique(key, axis=0, return_index=True, return_inverse=True)
@@ -725,7 +775,7 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
 
 
 def _split_by_group(cast, meshes):
-    """{groupe|None: [meshes]} selon le nom de matériau."""
+    """{group|None: [meshes]} based on the material name."""
     out = {}
     for m in meshes:
         out.setdefault(material_group(cast.mat_name(m.mat)), []).append(m)
@@ -736,15 +786,15 @@ _LOD_NAME_RE = re.compile(r"lod[_\-]?(\d+)", re.IGNORECASE)
 
 
 def import_model_cast(path, settings, name=None):
-    """Import d'un modèle (prop). Renvoie des objets nommés "<nom>_LOD<i>[_<groupe>]",
-    en unités du jeu (l'échelle est appliquée ensuite par la bibliothèque)."""
+    """Import a model (prop). Returns objects named "<name>_LOD<i>[_<group>]",
+    in game units (the library applies the scale afterwards)."""
     cast = CastFile(path)
     flip = detect_flip(cast)
     stem = name or os.path.splitext(os.path.basename(path))[0]
     stem = re.sub(r"[_\-\. ]?lod[_\-]?\d+$", "", stem, flags=re.IGNORECASE)
     file_lod = _LOD_NAME_RE.search(os.path.splitext(os.path.basename(path))[0][-8:])
 
-    # Un nœud modl par LOD (RSX) ; sinon tout est LOD de fichier
+    # One modl node per LOD (RSX); otherwise everything belongs to the file's LOD
     by_lod = {}
     for m in cast.meshes:
         lod = None
@@ -765,7 +815,7 @@ def import_model_cast(path, settings, name=None):
                 continue
             obj = bpy.data.objects.new(oname, me)
             if group:
-                obj["apx_group"] = group
+                obj[GROUP_KEY] = group
             bpy.context.scene.collection.objects.link(obj)
             objs.append(obj)
     cast.free()
@@ -773,19 +823,23 @@ def import_model_cast(path, settings, name=None):
 
 
 def import_world_cast(path, settings, collection, xf, offset, report=print):
-    """Import de la géométrie d'une map, découpée en tuiles carrées.
+    """Import a map's geometry, optionally split into square tiles.
 
-    xf : 3x3 (unités jeu -> Blender), offset : décalage en mètres retiré après transformation.
-    Les faces triggers/outils/dev vont dans des sous-collections séparées.
+    xf: 3x3 (game units -> Blender), offset: shift in meters removed after the transform.
+    Trigger / tool / dev faces go to separate sub-collections.
     """
     cast = CastFile(path)
     flip = detect_flip(cast)
-    tile = settings.world_tile_size
+    split = settings.world_split
+    tile = settings.world_tile_size if split == "TILES" else 0.0
     groups = {}
     for m in cast.meshes:
-        c = (m.pos.mean(axis=0).astype(np.float64) @ xf.T) - offset
-        key = (int(np.floor(c[0] / tile)), int(np.floor(c[1] / tile))) if tile > 0 else (0, 0)
         g = material_group(cast.mat_name(m.mat))
+        if split == "MATERIAL":
+            key = (0, m.mat)
+        else:
+            c = (m.pos.mean(axis=0).astype(np.float64) @ xf.T) - offset
+            key = (int(np.floor(c[0] / tile)), int(np.floor(c[1] / tile))) if tile > 0 else (0, 0)
         groups.setdefault((g or "", key), []).append(m)
 
     base = os.path.splitext(os.path.basename(path))[0]
@@ -797,7 +851,10 @@ def import_world_cast(path, settings, collection, xf, offset, report=print):
     for i, ((g, key), ms) in enumerate(sorted(groups.items())):
         wm.progress_update(i)
         center = np.array([(key[0] + 0.5) * tile, (key[1] + 0.5) * tile, 0.0]) if tile > 0 else np.zeros(3)
-        oname = f"{base}_{g + '_' if g else ''}tile_{key[0]}_{key[1]}"
+        if split == "MATERIAL":
+            oname = f"{base}_{cast.mat_name(key[1])}"
+        else:
+            oname = f"{base}_{g + '_' if g else ''}tile_{key[0]}_{key[1]}"
         me = build_mesh(oname, cast, ms, xf, settings, flip, mat_cache, origin=offset + center)
         if me is None:
             continue
@@ -805,7 +862,7 @@ def import_world_cast(path, settings, collection, xf, offset, report=print):
         o.location = center
         o["apx_world_tile"] = True
         if g:
-            o["apx_group"] = g
+            o[GROUP_KEY] = g
             col = sub.get(g)
             if col is None:
                 col = sub[g] = bpy.data.collections.new(f"{base}_{g}")
@@ -817,5 +874,5 @@ def import_world_cast(path, settings, collection, xf, offset, report=print):
     wm.progress_end()
     nmesh = len(cast.meshes)
     cast.free()
-    report(f"Géométrie : {nmesh} meshes -> {len(objs)} objets, {len(mat_cache)} matériaux")
+    report(f"Geometry: {nmesh} meshes -> {len(objs)} objects, {len(mat_cache)} materials")
     return objs

@@ -1,14 +1,14 @@
 schema_version = "1.0.0"
 
 id = "r5_map_loader"
-version = "1.4.0"
+version = "0.5.0"
 name = "Blender R5 Map Loader"
-tagline = "Charge les maps R5Reloaded avec LOD et déchargement dynamiques"
-maintainer = "fendegames7"
+tagline = "Loads R5Reloaded maps with dynamic LODs, regions and Cycles"
+maintainer = "Fendesk"
 type = "add-on"
 blender_version_min = "4.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 tags = ["Import-Export"]
 
 [permissions]
-files = "Lecture des exports de map et VPK, copie vers un autre disque"
+files = "Reads map exports, VPK files and sky images"

@@ -1,24 +1,25 @@
-"""Instanciation par Geometry Nodes : UN objet par modèle unique.
+"""Geometry Nodes instancing: ONE object per unique model.
 
-Chaque modèle = un nuage de points (1 point par prop, attributs apx_rot / apx_scale)
-+ un modificateur Geometry Nodes partagé qui, pour chaque point :
-  - choisit le LOD selon la distance à la sonde (APX_LOD_Probe),
-  - masque le prop s'il est HORS DU CHAMP DE VISION (frustum culling),
-  - masque le prop s'il est TROP PETIT À L'ÉCRAN (petits objets lointains),
-  - masque au-delà de la distance de culling (optionnel).
+Each model = a point cloud (one point per prop, attributes apx_rot / apx_scale) plus a shared
+Geometry Nodes modifier that, for every point:
+  - picks the LOD from the distance to the probe (APX_LOD_Probe),
+  - hides the prop when it is OUTSIDE THE FIELD OF VIEW (frustum culling),
+  - hides the prop when it is TOO SMALL ON SCREEN (small far-away objects),
+  - hides the prop beyond the culling distance (optional),
+  - hides the prop OUTSIDE THE ACTIVE REGION (APX_Region empty, see regions.py).
 
-La sonde est un empty que le timer place sur la vue 3D (ou la caméra) :
-  position = œil, rotation = orientation de la vue (regarde vers -Z),
-  échelle  = (tan(fov_x/2), tan(fov_y/2), mode) avec mode : 1 = frustum + taille écran,
-             0.5 = taille écran seulement (rendu), 0 = rien (vue orthographique).
-Tout le calcul se fait dans Blender (C++), rien n'est fait par prop en Python.
+The probe is an empty that the timer moves onto the 3D view (or the camera):
+  location = eye, rotation = view orientation (looking down -Z),
+  scale    = (tan(fov_x/2), tan(fov_y/2), mode) with mode: 1 = frustum + screen size,
+             0.5 = screen size only (render), 0 = nothing (orthographic view).
+Everything is computed by Blender (C++), nothing per prop in Python.
 """
 
 import bpy
 import numpy as np
 
 GROUP = "APX_Instancer"
-GROUP_VERSION = 3
+GROUP_VERSION = 4
 MAX_LEVELS = 5
 PROBE = "APX_LOD_Probe"
 
@@ -42,7 +43,7 @@ def get_group():
     ng["apx_ver"] = GROUP_VERSION
     _build(ng)
     if old is not None:
-        # Mise à jour d'une ancienne version : on remplace le groupe dans tous les modificateurs
+        # Upgrade from an older version: swap the group in every modifier
         for o in bpy.data.objects:
             for m in o.modifiers:
                 if m.type == "NODES" and m.node_group == old:
@@ -68,8 +69,9 @@ def _build(ng):
     _sock(ng, "Use Cull", "NodeSocketBool", default=False)
     _sock(ng, "Radius", "NodeSocketFloat", default=1.0)
     _sock(ng, "Use Frustum", "NodeSocketBool", default=True)
-    _sock(ng, "Frustum Margin", "NodeSocketFloat", default=1.25)
+    _sock(ng, "Frustum Margin", "NodeSocketFloat", default=1.5)
     _sock(ng, "Min Screen", "NodeSocketFloat", default=0.0)
+    _sock(ng, "Region", "NodeSocketObject")
 
     N, L = ng.nodes, ng.links
     gi = N.new("NodeGroupInput"); gi.location = (-2200, 0)
@@ -80,7 +82,7 @@ def _build(ng):
         L.new(a, b)
 
     def math(op, a, b=None, *rest):
-        # math(op, a, b, loc) ou math(op, a, b, c, loc) pour MULTIPLY_ADD
+        # math(op, a, b, loc) or math(op, a, b, c, loc) for MULTIPLY_ADD
         c, loc = (rest if len(rest) == 2 else (None, rest[0] if rest else (0, 0)))
         n = N.new("ShaderNodeMath"); n.operation = op; n.location = loc
         for idx, v in ((0, a), (1, b), (2, c)):
@@ -108,7 +110,7 @@ def _build(ng):
             link(b, n.inputs[1])
         return n.outputs[0]
 
-    # --- sonde --------------------------------------------------------------
+    # --- probe ---------------------------------------------------------------
     oi = N.new("GeometryNodeObjectInfo"); oi.location = (-2000, 300)
     oi.transform_space = "RELATIVE"
     link(G["Probe"], oi.inputs["Object"])
@@ -123,13 +125,13 @@ def _build(ng):
     link(oi.outputs["Scale"], psc.inputs[0])
     tanx, tany, mode = psc.outputs[0], psc.outputs[1], psc.outputs[2]
 
-    # Taille du prop = rayon du modèle x échelle du point
+    # Prop size = model radius x point scale
     scl = N.new("GeometryNodeInputNamedAttribute"); scl.data_type = "FLOAT"; scl.location = (-2000, -300)
     scl.inputs["Name"].default_value = "apx_scale"
     size = math("MULTIPLY", G["Radius"], scl.outputs[0], (-1800, -300))
     size15 = math("MULTIPLY", size, 1.5, (-1600, -300))
 
-    # --- LOD par distance ---------------------------------------------------
+    # --- LOD by distance -----------------------------------------------------
     d = math("MULTIPLY", dist, G["Dist Scale"], (-1400, 250))
     lvl = None
     for i in range(1, MAX_LEVELS):
@@ -142,7 +144,7 @@ def _build(ng):
     link(G["Use LOD"], sw.inputs[0]); link(forced, sw.inputs[1]); link(lvl, sw.inputs[2])
     level = sw.outputs[0]
 
-    # --- champ de vision (frustum) ------------------------------------------
+    # --- field of view (frustum) ---------------------------------------------
     inv = N.new("FunctionNodeInvertRotation"); inv.location = (-1600, 600)
     link(oi.outputs["Rotation"], inv.inputs[0])
     rv = N.new("FunctionNodeRotateVector"); rv.location = (-1400, 600)
@@ -164,19 +166,23 @@ def _build(ng):
     fr_on = boolean("AND", G["Use Frustum"], compare("GREATER_THAN", mode, 0.75, (-600, 1000)), (-450, 1000))
     fr_fail = boolean("NIMPLY", fr_on, infr, (-150, 900))
 
-    # --- taille à l'écran : rayon / (distance * tan(fov_y/2)) ----------------
+    # --- size on screen: radius / (distance * tan(fov_y/2)) ------------------
     denom = math("MAXIMUM", math("MULTIPLY", dist, tany, (-1000, -450)), 1e-4, (-850, -450))
     screen = math("DIVIDE", size, denom, (-700, -450))
     small = compare("LESS_THAN", screen, G["Min Screen"], (-550, -450))
     sc_on = compare("GREATER_THAN", mode, 0.25, (-550, -600))
     sc_fail = boolean("AND", small, sc_on, (-400, -500))
 
-    # --- culling par distance -----------------------------------------------
+    # --- distance culling ------------------------------------------------------
     far = compare("GREATER_EQUAL", d, G["Cull"], (-700, -750))
     far_fail = boolean("AND", far, G["Use Cull"], (-550, -750))
 
     any_fail = boolean("OR", boolean("OR", fr_fail, sc_fail, (-250, -300)), far_fail, (-100, -300))
-    culled = boolean("AND", any_fail, G["Use LOD"], (50, -300))   # LOD désactivé = tout visible
+    culled = boolean("AND", any_fail, G["Use LOD"], (50, -300))   # LOD disabled = everything visible
+
+    # --- active region (XY disc), independent from the LOD switch -------------
+    region_fail = _region_fail_nodes(N, L, G["Region"], pos.outputs[0], (-700, -1000))
+    culled = boolean("OR", culled, region_fail, (150, -400))
 
     rot = N.new("GeometryNodeInputNamedAttribute"); rot.data_type = "FLOAT_VECTOR"; rot.location = (200, 600)
     rot.inputs["Name"].default_value = "apx_rot"
@@ -200,13 +206,40 @@ def _build(ng):
     link(join.outputs[0], go.inputs[0])
 
 
+def _region_fail_nodes(N, L, region_socket, position, loc):
+    """True when the point is outside the active region.
+    Region empty: location = center, scale.x = radius (m), scale.z > 0.5 = enabled."""
+    x, y = loc
+    oi = N.new("GeometryNodeObjectInfo"); oi.location = (x - 400, y)
+    oi.transform_space = "RELATIVE"
+    L.new(region_socket, oi.inputs["Object"])
+    sub = N.new("ShaderNodeVectorMath"); sub.operation = "SUBTRACT"; sub.location = (x - 200, y)
+    L.new(position, sub.inputs[0]); L.new(oi.outputs["Location"], sub.inputs[1])
+    mul = N.new("ShaderNodeVectorMath"); mul.operation = "MULTIPLY"; mul.location = (x, y)
+    L.new(sub.outputs[0], mul.inputs[0])
+    mul.inputs[1].default_value = (1.0, 1.0, 0.0)            # horizontal distance only
+    ln = N.new("ShaderNodeVectorMath"); ln.operation = "LENGTH"; ln.location = (x + 200, y)
+    L.new(mul.outputs[0], ln.inputs[0])
+    sep = N.new("ShaderNodeSeparateXYZ"); sep.location = (x, y - 200)
+    L.new(oi.outputs["Scale"], sep.inputs[0])
+    out = N.new("FunctionNodeCompare"); out.data_type = "FLOAT"; out.operation = "GREATER_THAN"
+    out.location = (x + 400, y)
+    L.new(ln.outputs["Value"], out.inputs[0]); L.new(sep.outputs[0], out.inputs[1])
+    on = N.new("FunctionNodeCompare"); on.data_type = "FLOAT"; on.operation = "GREATER_THAN"
+    on.location = (x + 400, y - 200)
+    L.new(sep.outputs[2], on.inputs[0]); on.inputs[1].default_value = 0.5
+    both = N.new("FunctionNodeBooleanMath"); both.operation = "AND"; both.location = (x + 600, y)
+    L.new(out.outputs[0], both.inputs[0]); L.new(on.outputs[0], both.inputs[1])
+    return both.outputs[0]
+
+
 def _ids(ng):
     return {it.name: it.identifier for it in ng.interface.items_tree
             if getattr(it, "item_type", "SOCKET") == "SOCKET" and it.in_out == "INPUT"}
 
 
 # --------------------------------------------------------------------------
-# Sonde
+# Probe
 # --------------------------------------------------------------------------
 def get_probe(scene):
     p = bpy.data.objects.get(PROBE)
@@ -224,7 +257,7 @@ def get_probe(scene):
 
 
 def set_probe(scene, eye, quat=None, tanx=None, tany=None, mode=None):
-    """Place la sonde. mode : 1 = frustum + taille écran, 0.5 = taille écran seule, 0 = aucun."""
+    """Move the probe. mode: 1 = frustum + screen size, 0.5 = screen size only, 0 = none."""
     p = get_probe(scene)
     if p.rotation_mode != "QUATERNION":
         p.rotation_mode = "QUATERNION"
@@ -243,10 +276,11 @@ def move_probe(scene, eye):
 
 
 # --------------------------------------------------------------------------
-# Création des objets
+# Object creation
 # --------------------------------------------------------------------------
 def create_instancer(key, lods, placements_xf, collection, scene):
-    """placements_xf : liste de (loc(3), euler_xyz(3), scale) en espace Blender."""
+    """placements_xf: list of (loc(3), euler_xyz(3), scale) in Blender space."""
+    from .regions import get_region
     n = len(placements_xf)
     loc = np.array([p[0] for p in placements_xf], dtype=np.float32).reshape(-1, 3)
     rot = np.array([p[1] for p in placements_xf], dtype=np.float32).reshape(-1, 3)
@@ -268,6 +302,7 @@ def create_instancer(key, lods, placements_xf, collection, scene):
     mod.node_group = get_group()
     ids = _ids(mod.node_group)
     mod[ids["Probe"]] = get_probe(scene)
+    mod[ids["Region"]] = get_region(scene)
     for i in range(MAX_LEVELS):
         mod[ids[f"LOD{i}"]] = lods[i] if i < len(lods) else None
     mod[ids["Levels"]] = min(len(lods), MAX_LEVELS)
@@ -279,9 +314,10 @@ def instancer_objects(scene):
     return [o for o in scene.objects if "apx_gn" in o and o.type == "MESH"]
 
 
-def apply_settings(scene, force_level=None):
-    """Pousse les réglages LOD/culling de la scène dans tous les modificateurs."""
+def apply_settings(scene, force_level=None, min_screen=None):
+    """Push the scene's LOD / culling settings into every modifier."""
     from . import library
+    from .regions import get_region
     s = scene.apx_settings
     ng = bpy.data.node_groups.get(GROUP)
     if ng is None:
@@ -290,6 +326,9 @@ def apply_settings(scene, force_level=None):
         ng = get_group()
     ids = _ids(ng)
     dists = sorted(s.lod_distances)
+    region = get_region(scene)
+    if min_screen is None:
+        min_screen = (s.min_screen_pct / 100.0) if s.cull_small_props else 0.0
     n = 0
     for o in instancer_objects(scene):
         mod = o.modifiers.get("APX_Instancer")
@@ -309,7 +348,7 @@ def apply_settings(scene, force_level=None):
             "Radius": radius,
             "Use Frustum": s.use_frustum,
             "Frustum Margin": s.frustum_margin,
-            "Min Screen": (s.min_screen_pct / 100.0) if s.cull_small_props else 0.0,
+            "Min Screen": min_screen,
         }
         for i in range(1, MAX_LEVELS):
             vals[f"D{i}"] = dists[i - 1] if i - 1 < len(dists) else 1e12
@@ -319,6 +358,9 @@ def apply_settings(scene, force_level=None):
             if mod.get(ident) != v:
                 mod[ident] = v
                 changed = True
+        if mod.get(ids["Region"]) != region:
+            mod[ids["Region"]] = region
+            changed = True
         if changed:
             o.update_tag()
             n += 1
