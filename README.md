@@ -1,15 +1,25 @@
-# Blender R5 Map Loader (Blender 4.2+)
+# Blender R5 Map Loader 0.6.0 (Blender 4.2+)
 
 Loads R5Reloaded / Apex Legends maps into Blender: map geometry (`.cast`), static props (`.mprt`),
 dynamic props and points of interest (`.ent`, read straight from R5Reloaded VPKs). The add-on handles
 instancing, dynamic LODs, unloading props you cannot see, regions / POIs, the sky and a Cycles setup.
 
 ## Install
-Blender > Edit > Preferences > Get Extensions > ▾ (top right) > **Install from Disk…** > `r5_map_loader-0.5.3.zip`.
-Uninstall the previous version first, then load the map into an empty file.
+Blender > Edit > Preferences > Get Extensions > ▾ (top right) > **Install from Disk…** >
+`Blender-R5-Map-Loader-BETA-0.6.0.zip`.
+Uninstall the previous version first, then load the map into an empty file (or re-import it: materials from older
+versions are rebuilt).
 The old *Apex Legends Map Importer* (`apex_map_importer`) can stay installed: since 0.5.1 the two add-ons no longer
 share operator / panel / property names, so each one can be disabled or uninstalled on its own.
 The panels live in the 3D View > Sidebar (N) > **R5 Map Loader** tab. The importer is also in File > Import.
+
+## What's new in 0.6.0
+- **Sky**: sun colour (with a reset), atmosphere (air, dust, ozone) over image / dome skies, volumetric fog.
+  Every value updates live once *Apply sky* has been pressed.
+- **Visibility > Particle / mist cards**: the big mist planes of the climatizer vents (and other effect cards) can be
+  hidden. Hidden by default.
+- **Ice**: the ice spikes (Ground Zero), icicles and ice mods are no longer black.
+- **LOD**: the automatic LOD update can no longer stay frozen after an interrupted render.
 
 ## Load a map
 ```
@@ -30,6 +40,9 @@ World Edge/
   - triggers
   - tool brushes (clip, blocklight, skybox…)
   - **light shafts & atmosphere volumes**: godray / atmosphere props, which show up as big opaque ellipses or cones
+  - **particle / mist cards**: crossed planes with a mist or steam texture that are animated particles in game, e.g.
+    `vent_climatizer_mesh_idle02` (~27 × 30 m of mist next to the cloud-seeding climatizer vents) or the
+    `fog_all` sheets of the distant scenery. When shown, they render as a soft additive mist.
   - game mode barriers
   - dev textures
 
@@ -43,7 +56,8 @@ World Edge/
   - *Whole map* brings everything back. Nothing is re-imported.
 - **LOD & streaming**: the LODs can be switched off. Props are also unloaded when they are outside the field of
   view or too small on screen. Recomputing happens when the view stops moving, so navigation stays smooth.
-- **Sky**: three sources.
+  Right after an import, the first update can take ~20 s while Blender prepares the display.
+- **Sky**: four sources, then sun, atmosphere and fog. Once *Apply sky* has been pressed, every value updates live.
   - Procedural sky + sun. If an uncompressed env `.ent` with `light_environment` was loaded, the map's own sun is used.
   - A panorama / HDRI.
   - An **in-game sky dome**: square image with a round sky, zenith in the centre and the horizon on the circle
@@ -52,6 +66,14 @@ World Edge/
     A square image picked in *Panorama* mode switches to this mode by itself.
   - A 6-face cubemap: `name_000..005`, `px/nx/py/ny/pz/nz` or `right/left/up/down/front/back`, for example a sky
     exported with RSX. It is converted to a panorama.
+  - **Sun**: elevation, rotation, strength and **colour**. *Reset* returns to the map's sun colour
+    (`light_environment`) when one was loaded, otherwise warm white.
+  - **Atmosphere** (image skies): Blender's physical sky blended over the image, strongest towards the horizon.
+    *Air (gas)* = blue sky / orange sunsets, *Dust / haze* = whitish haze and sun glow, *Ozone* = deeper blue.
+    The procedural sky uses the same three densities directly.
+  - **Volumetric fog**: a volume box around the map (density, colour, anisotropy, EEVEE range). A world volume is
+    not used: EEVEE treats it as infinite and it absorbs the whole sky and sun. Fog makes renders heavier,
+    especially in Cycles.
 - **Render (Cycles)**: *Preview* and *Final* presets.
   - Uses the GPU when one is enabled in Preferences > System > Cycles Render Devices.
   - Sets denoising, adaptive sampling and enough transparent bounces for foliage.
@@ -61,15 +83,19 @@ World Edge/
 ## Video memory
 A full map has ~4,400 unique textures. On import (and when a saved map is opened) the add-on lowers Blender's
 viewport texture limit to *Optimization > Textures* (512 by default; it never raises a lower one). Measured on
-World's Edge with a 16 GB RTX 5080, Material Preview:
+World's Edge with a 16 GB RTX 5080:
 
 | Limit | Solid | Material Preview | Video memory |
 |---|---|---|---|
 | none | 2.7–8 fps | 0.2 fps, 12 s frames, driver reset (TDR) | > 16 GB |
 | 1024 | 35 fps | 8.8 fps | 13.6 GB |
-| 512 | 38 fps | 8.7 fps | 6.2 GB |
+| 512 | 38 fps | 11.9 fps | 6.6 GB |
 
-*Empties* instancing on a full map (World Edge = 433k objects) updates its LODs but Blender draws ~1 fps with that many objects:
+The textures cost video memory and shading time whatever the instancing mode: Geometry Nodes only place the props
+and pick their LOD, the materials (shader nodes) display the textures. For fast navigation, use Solid mode with
+*Color: Texture* (one texture per material, no shader).
+
+*Empties* instancing on a full map (433k objects) updates its LODs but Blender draws ~1 fps with that many objects:
 use Geometry Nodes for a full map and keep Empties for *Import an area only*.
 
 ## Notes
@@ -79,8 +105,11 @@ use Geometry Nodes for a full map and keep Empties for *Import an area only*.
 - Legion+ names the texture slots by position (albedo, normal, gloss, specular, emissive, ao, cavity), whatever
   the shader. The add-on trusts the file names first (`_albedo2Texture`, `_opacityMultiplyTexture`...), then the
   position, with the blend-material layout `[albedo, albedo2, normal, normal2, gloss, gloss2, spec]` for `_bm`.
-- Blend materials (`_bm`): both layers are exported, but not the vertex colours that blend them (all white), so the
-  first layer is shown.
+- Blend materials (`_bm`) show the layer stored in their `albedo` slot. Legion+ exports both layers but not the
+  vertex colours that blend them, so some ground shows its second layer (snow) where the game shows grass or moss.
+- Ice (`desertlands_ice_03_wld_dark/bright…`): the albedo is a flat dark grey, the look comes from the game's ice
+  shader. The add-on rebuilds it from the material's ice colour texture, gloss mask and ice normal map (light blue,
+  glossy, a little subsurface and a clear coat). The snow that covers part of the spikes in game is not shown.
 - Decals: the transparency comes from the `opacityMultiply` texture. Solid mode cannot apply it, so decals that use
   it are invisible in Solid and only appear in Material Preview / Rendered.
 - Textures are read with retries: external drives sometimes report existing files as missing. A material whose
