@@ -88,6 +88,23 @@ def library_stats():
     return models, instances, tris0
 
 
+_LIMIT_SIZE = {"CLAMP_OFF": 1 << 30, "CLAMP_8192": 8192, "CLAMP_4096": 4096, "CLAMP_2048": 2048,
+               "CLAMP_1024": 1024, "CLAMP_512": 512, "CLAMP_256": 256, "CLAMP_128": 128}
+
+
+def apply_texture_limit(limit, only_lower=True):
+    """Set Blender's viewport texture limit. A full map has ~4,400 unique textures: without a limit (or
+    at 1024 on a 16 GB card) Material Preview fills the video memory and the GPU driver resets (TDR).
+    Measured on World's Edge, RTX 5080: no limit -> 12 s frames; 1024 -> 13.6 GB; 512 -> 6.2 GB, same fps.
+    Returns the limit now in use."""
+    sysp = bpy.context.preferences.system
+    cur = sysp.gl_texture_limit
+    if only_lower and _LIMIT_SIZE.get(cur, 0) <= _LIMIT_SIZE.get(limit, 0):
+        return cur
+    sysp.gl_texture_limit = limit
+    return limit
+
+
 def setup_viewport_for_large_map(clip_end=20000.0):
     for win in bpy.context.window_manager.windows:
         for area in win.screen.areas:
@@ -106,13 +123,13 @@ def setup_viewport_for_large_map(clip_end=20000.0):
 
 class R5_OT_optimize(bpy.types.Operator):
     """De-duplicate materials / images, merge vertices and purge orphan data"""
-    bl_idname = "apx.optimize"
+    bl_idname = "r5.optimize"
     bl_label = "Optimize scene"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         from . import lod_system
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         m = dedupe_materials()
         i = dedupe_images()
         v = merge_library_vertices(s.merge_distance) if s.merge_distance > 0 else 0
@@ -125,19 +142,19 @@ class R5_OT_optimize(bpy.types.Operator):
 class R5_OT_texture_limit(bpy.types.Operator):
     """Limit the texture resolution in the viewport (Blender preference: Viewport > Texture Limit).
 Keeps video memory from filling up, which makes textures disappear"""
-    bl_idname = "apx.texture_limit"
+    bl_idname = "r5.texture_limit"
     bl_label = "Apply texture limit"
 
     def execute(self, context):
-        s = context.scene.apx_settings
-        context.preferences.system.gl_texture_limit = s.texture_limit
+        s = context.scene.r5_settings
+        apply_texture_limit(s.texture_limit, only_lower=False)
         self.report({"INFO"}, f"Viewport texture limit: {s.texture_limit.replace('CLAMP_', '')}")
         return {"FINISHED"}
 
 
 class R5_OT_viewport_setup(bpy.types.Operator):
     """Set the viewport / camera clipping for a large map and show textures in Solid mode"""
-    bl_idname = "apx.viewport_setup"
+    bl_idname = "r5.viewport_setup"
     bl_label = "Set up viewport (large map)"
 
     def execute(self, context):

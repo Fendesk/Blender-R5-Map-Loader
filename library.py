@@ -113,7 +113,7 @@ def _import_file(path):
             bpy.ops.import_scene.obj(filepath=path)
     elif ext == ".cast":
         from . import castfile      # built-in reader (the Cast add-on is not needed)
-        return castfile.import_model_cast(path, bpy.context.scene.apx_settings)
+        return castfile.import_model_cast(path, bpy.context.scene.r5_settings)
     elif ext == ".semodel":
         if not hasattr(bpy.ops.import_scene, "semodel"):
             raise RuntimeError("The 'SEModel' add-on is required for .semodel files")

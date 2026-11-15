@@ -318,7 +318,7 @@ def apply_settings(scene, force_level=None, min_screen=None):
     """Push the scene's LOD / culling settings into every modifier."""
     from . import library
     from .regions import get_region
-    s = scene.apx_settings
+    s = scene.r5_settings
     ng = bpy.data.node_groups.get(GROUP)
     if ng is None:
         return 0

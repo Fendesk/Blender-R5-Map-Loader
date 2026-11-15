@@ -77,7 +77,7 @@ def _map_name(path):
 # --------------------------------------------------------------------------
 def import_world(context, cast_path, report=print):
     scene = context.scene
-    s = scene.apx_settings
+    s = scene.r5_settings
     name = _map_name(cast_path)
     col = _get_child_collection(scene.collection, f"APX_World_{name}")
     off = _offset(scene, s, lambda: Vector((0, 0, 0)))
@@ -87,7 +87,7 @@ def import_world(context, cast_path, report=print):
 
 def import_map(context, paths, report=print):
     scene = context.scene
-    s = scene.apx_settings
+    s = scene.r5_settings
     t0 = time.time()
     if context.object and context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
@@ -193,7 +193,7 @@ def import_map(context, paths, report=print):
         if s.instancing_mode == "GN":
             created = _instances_gn(scene, placements, available, map_col, map_name, unit, offset)
         else:
-            created = _instances_empty(placements, available, map_col, map_name, unit, offset, s)
+            created = _instances_empty(placements, available, map_col, map_name, unit, offset, s, wm)
 
         if missing:
             txt = bpy.data.texts.get("APX_missing_models") or bpy.data.texts.new("APX_missing_models")
@@ -217,6 +217,9 @@ def import_map(context, paths, report=print):
 
     if s.setup_viewport_on_import:
         optimize.setup_viewport_for_large_map()
+        if s.cast_load_textures:
+            lim = optimize.apply_texture_limit(s.texture_limit)
+            report(f"Viewport texture limit: {lim.replace('CLAMP_', '').replace('OFF', 'none')}")
 
     visibility.apply(scene)
     context.view_layer.update()
@@ -226,6 +229,10 @@ def import_map(context, paths, report=print):
            f"{', geometry imported' if world_paths else ''}{f', {n_poi} POIs' if n_poi else ''}"
            f" ({time.time() - t0:.1f}s)")
     report(msg)
+    if s.instancing_mode != "GN" and created > 100000:
+        # Measured on World's Edge (433k empties): LODs update but Blender draws ~0.8 fps with that many objects
+        report(f"WARNING: {created} separate objects make the viewport very slow (~1 fps). Use Geometry Nodes "
+               f"instancing for a full map, or 'Import an area only' for this mode")
     return created, len(available), missing
 
 
@@ -270,14 +277,24 @@ def _instances_gn(scene, placements, available, map_col, map_name, unit, offset)
     return n
 
 
-def _instances_empty(placements, available, map_col, map_name, unit, offset, s):
+def _instances_empty(placements, available, map_col, map_name, unit, offset, s, wm=None):
+    # Blender keeps bpy.data.objects sorted by name: creating "a", "z", "a.001", "m"... inserts in the
+    # middle of the list every time (quadratic, ~15 min for World's Edge). Creating the empties in name
+    # order always appends at the end (linear, ~25 s for 433k props).
+    keyed = sorted(((placement.model_key(p.model), p) for p in placements), key=lambda kp: kp[0])
+    keyed = [(k, p) for k, p in keyed if available.get(k)]
     cat_cols = {}
     created = 0
-    for p in placements:
-        key = placement.model_key(p.model)
-        lods = available.get(key)
-        if not lods:
-            continue
+    total = len(keyed)
+    if wm is not None:
+        wm.progress_begin(0, max(total, 1))
+    t0 = time.time()
+    for key, p in keyed:
+        lods = available[key]
+        if created % 20000 == 0 and created:
+            if wm is not None:
+                wm.progress_update(created)
+            print(f"[R5] empties {created}/{total} ({time.time() - t0:.0f}s)")
         if s.split_by_category:
             cat = _category(p.model)
             col = cat_cols.get(cat)
@@ -299,13 +316,15 @@ def _instances_empty(placements, available, map_col, map_name, unit, offset, s):
             o["apx_targetname"] = p.name
         col.objects.link(o)
         created += 1
+    if wm is not None:
+        wm.progress_end()
     return created
 
 
 # --------------------------------------------------------------------------
-class APX_OT_import_map(bpy.types.Operator, ImportHelper):
+class R5_OT_import_map(bpy.types.Operator, ImportHelper):
     """Load an R5 / Apex map: placements (.mprt/.ent/.vpk/.json/.csv) and/or geometry (.cast)"""
-    bl_idname = "apx.import_map"
+    bl_idname = "r5.import_map"
     bl_label = "Load R5 map"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -315,7 +334,7 @@ class APX_OT_import_map(bpy.types.Operator, ImportHelper):
     directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN"})
 
     def draw(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         col = self.layout.column()
         col.prop(s, "models_dir")
         col.label(text="(empty = '_models' folder next to the file)")
@@ -348,9 +367,9 @@ class APX_OT_import_map(bpy.types.Operator, ImportHelper):
         return {"FINISHED"}
 
 
-class APX_OT_update_lods(bpy.types.Operator):
+class R5_OT_update_lods(bpy.types.Operator):
     """Recompute the LODs now"""
-    bl_idname = "apx.update_lods"
+    bl_idname = "r5.update_lods"
     bl_label = "Update LODs"
 
     def execute(self, context):
@@ -359,13 +378,13 @@ class APX_OT_update_lods(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class APX_OT_show_all(bpy.types.Operator):
+class R5_OT_show_all(bpy.types.Operator):
     """Show every prop in LOD0 (cancels culling and auto update)"""
-    bl_idname = "apx.show_all"
+    bl_idname = "r5.show_all"
     bl_label = "Show everything in LOD0"
 
     def execute(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         s.lod_auto_update = False
         lod_system.rebuild(context.scene)
         n = lod_system.apply_forced(context.scene, 0)
@@ -374,9 +393,9 @@ class APX_OT_show_all(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class APX_OT_make_real(bpy.types.Operator):
+class R5_OT_make_real(bpy.types.Operator):
     """Turn the selected instances (Empties mode) into real objects"""
-    bl_idname = "apx.make_real"
+    bl_idname = "r5.make_real"
     bl_label = "Make real (selection)"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -388,6 +407,7 @@ class APX_OT_make_real(bpy.types.Operator):
         sel = [o for o in context.selected_objects if "apx_model" in o]
         for o in sel:
             o.hide_viewport = False
+            o.instance_type = "COLLECTION"     # culled empties have their instancing switched off
         bpy.ops.object.duplicates_make_real(use_base_parent=False, use_hierarchy=False)
         for o in sel:
             bpy.data.objects.remove(o, do_unlink=True)
@@ -396,10 +416,10 @@ class APX_OT_make_real(bpy.types.Operator):
 
 
 def menu_import(self, context):
-    self.layout.operator(APX_OT_import_map.bl_idname, text="R5 Map Loader (.mprt/.cast/.ent/.vpk)")
+    self.layout.operator(R5_OT_import_map.bl_idname, text="R5 Map Loader (.mprt/.cast/.ent/.vpk)")
 
 
-CLASSES = (APX_OT_import_map, APX_OT_update_lods, APX_OT_show_all, APX_OT_make_real)
+CLASSES = (R5_OT_import_map, R5_OT_update_lods, R5_OT_show_all, R5_OT_make_real)
 
 
 def register():
@@ -409,6 +429,9 @@ def register():
 
 
 def unregister():
-    bpy.types.TOPBAR_MT_file_import.remove(menu_import)
+    try:
+        bpy.types.TOPBAR_MT_file_import.remove(menu_import)
+    except Exception:  # noqa: BLE001
+        pass
     for c in reversed(CLASSES):
         bpy.utils.unregister_class(c)

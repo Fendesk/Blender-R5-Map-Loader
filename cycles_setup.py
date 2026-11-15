@@ -35,7 +35,7 @@ def gpu_available(context):
 
 def setup_cycles(context, preset):
     scene = context.scene
-    s = scene.apx_settings
+    s = scene.r5_settings
     r = scene.render
     r.engine = "CYCLES"
     c = scene.cycles
@@ -79,7 +79,7 @@ def setup_cycles(context, preset):
 
 class R5_OT_setup_cycles(bpy.types.Operator):
     """Configure Cycles for rendering the map (heavy)"""
-    bl_idname = "apx.setup_cycles"
+    bl_idname = "r5.setup_cycles"
     bl_label = "Set up Cycles"
     bl_options = {"REGISTER", "UNDO"}
 

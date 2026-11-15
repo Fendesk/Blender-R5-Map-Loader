@@ -22,7 +22,7 @@ def group_objects():
 
 
 def apply(scene):
-    s = scene.apx_settings
+    s = scene.r5_settings
     n = 0
     for g, objs in group_objects().items():
         hidden = getattr(s, f"hide_{g}")
@@ -40,7 +40,7 @@ def counts():
 
 class R5_OT_select_group(bpy.types.Operator):
     """Select the visible objects of a group (triggers, tools...)"""
-    bl_idname = "apx.select_group"
+    bl_idname = "r5.select_group"
     bl_label = "Select"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -58,14 +58,14 @@ class R5_OT_select_group(bpy.types.Operator):
 
 class R5_OT_hide_models(bpy.types.Operator):
     """Hide or show every prop model whose name contains the text (e.g. "godray", "sphere")"""
-    bl_idname = "apx.hide_models"
+    bl_idname = "r5.hide_models"
     bl_label = "Hide / show models by name"
     bl_options = {"REGISTER", "UNDO"}
 
     hide: bpy.props.BoolProperty(default=True)
 
     def execute(self, context):
-        text = context.scene.apx_settings.model_filter.strip().lower()
+        text = context.scene.r5_settings.model_filter.strip().lower()
         if not text:
             self.report({"WARNING"}, "Type part of a model name first")
             return {"CANCELLED"}

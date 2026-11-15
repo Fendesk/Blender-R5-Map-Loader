@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender R5 Map Loader",
     "author": "Fendesk",
-    "version": (0, 5, 0),
+    "version": (0, 5, 3),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar (N) > R5 Map Loader  |  File > Import",
     "description": "Loads R5Reloaded / Apex maps (.mprt, .cast, .ent, .vpk) with instancing, switchable "
@@ -29,6 +29,26 @@ def register():
         m.register()
 
 
+def _force_unregister(m):
+    """Fallback when a module's unregister() failed halfway: drop whatever is still registered."""
+    for c in reversed(getattr(m, "CLASSES", ())):
+        if getattr(c, "is_registered", False):
+            try:
+                bpy.utils.unregister_class(c)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def unregister():
+    # Never raise here: Blender aborts the uninstall / disable when unregister() fails.
     for m in reversed(_MODULES):
-        m.unregister()
+        try:
+            m.unregister()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[R5] unregister {m.__name__}: {exc}")
+            _force_unregister(m)
+    if hasattr(bpy.types.Scene, "r5_settings"):
+        try:
+            del bpy.types.Scene.r5_settings
+        except Exception:  # noqa: BLE001
+            pass

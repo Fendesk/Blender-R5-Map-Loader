@@ -75,7 +75,12 @@ _CUTOUT_RE = re.compile(r"(?:^|[_\-\s\d])(?:leaf|leaves|foliage|grass|fern|bush|
                         r"moss_clump|flower|weed|fence|chainlink|chain_link|grate|grating|net|alpha|cutout|hair|"
                         r"fx|glass)")
 
-MAT_VERSION = 6
+# Blend materials ("_bm"): two layers (albedo/albedo2, normal/normal2, gloss/gloss2...)
+_BM_RE = re.compile(r"_bm($|_)")
+# ... which are still real overlays when their name says so
+_BM_OVERLAY_RE = re.compile(r"transparent|decal|_b2t($|_)|_bt($|_)")
+
+MAT_VERSION = 7
 
 
 def material_group(name):
@@ -90,8 +95,18 @@ def is_fx_model(key):
     return FX_MODEL_RE.search(key.lower()) is not None
 
 
+def is_blend_material(name):
+    return _BM_RE.search(name.lower()) is not None
+
+
 def is_overlay(name):
-    return _OVERLAY_RE.search(name.lower()) is not None
+    low = name.lower()
+    if _OVERLAY_RE.search(low) is None:
+        return False
+    # "..._water_puddles_bm", "..._grime_bm": full surfaces blending two layers, not decals
+    if _BM_RE.search(low) and not _BM_OVERLAY_RE.search(low):
+        return False
+    return True
 
 
 def is_vctint(name):
@@ -276,6 +291,8 @@ class CastFile:
 # --------------------------------------------------------------------------
 _ROLE_KEYS = (
     # (pattern at the end of the file name / slot name, role). Order = priority.
+    ("albedo2texture", "albedo2"), ("gloss2texture", "gloss2"), ("spec2texture", "specular2"),
+    ("specular2texture", "specular2"), ("detailtexture", "detail"),
     ("albedotexture", "albedo"), ("diffusetexture", "albedo"), ("basecolor", "albedo"),
     ("normal2texture", "normal2"), ("detailnormaltexture", "detailnormal"),
     ("normaltexture", "normal"), ("glosstexture", "gloss"), ("speculartexture", "specular"),
@@ -297,6 +314,50 @@ _SLOT = {"albedo": "albedo", "diffuse": "albedo", "color": "albedo", "normal": "
 _EMISSIVE_WORDS = {"light", "lights", "lamp", "lamps", "screen", "screens", "emissive", "emis", "glow", "neon",
                    "holo", "led", "leds", "monitor", "illum", "lit", "lightstrip"}
 _EMISSIVE_RE = re.compile(r"lava_(river|flow|fall|pool|stream)|magma|molten")
+# Legion+ names the slots by POSITION (albedo, normal, gloss, specular, emissive, ao, cavity), whatever
+# the shader. Blend materials store [albedo, albedo2, normal, normal2, gloss, gloss2, spec]:
+_BM_SLOT_ROLES = {"albedo": "albedo", "normal": "albedo2", "gloss": "normal", "specular": "normal2",
+                  "emissive": "gloss", "ao": "gloss2", "cavity": "specular"}
+
+
+def texture_roles(cast, cm, name):
+    """role -> texture hash. Roles found in the file names win; slot names (positional) only fill
+    the roles still missing, using the blend-material layout when needed.
+    Returns (roles, unnamed slots [(slot, hash)])."""
+    named, unnamed = {}, []
+    for slot, h2 in cm.slots.items():
+        role = role_from_filename(cast.texture_path(h2))
+        if role is None:
+            unnamed.append((slot, h2))
+        else:
+            named.setdefault(role, h2)
+    blend = is_blend_material(name) or any(r in named for r in ("albedo2", "normal2", "gloss2"))
+    roles = dict(named)
+    for slot, h2 in unnamed:
+        key = slot.lower().replace("texture", "")
+        if blend:
+            role = _BM_SLOT_ROLES.get(key, key)
+        else:
+            role = _SLOT.get(key, key)
+            if role == "emissive" and not _looks_emissive(name):
+                role = "emissive?"
+        roles.setdefault(role, h2)
+    return roles, (unnamed if not blend else [])
+
+
+def _mask_like(img):
+    """Grey-scale image with some variation (opacity / blend mask), i.e. not a normal map or a colour map."""
+    try:
+        w, h = img.size
+        if not w or not h:
+            return False
+        px = np.empty(w * h * 4, np.float32)
+        img.pixels.foreach_get(px)
+    except (RuntimeError, ValueError):
+        return False
+    rgb = px.reshape(-1, 4)[:: max(1, (w * h) // 20000), :3]
+    grey = np.abs(rgb[:, 0] - rgb[:, 1]).mean() < 0.02 and np.abs(rgb[:, 1] - rgb[:, 2]).mean() < 0.02
+    return bool(grey and rgb[:, 0].std() > 0.05)
 
 
 def role_from_filename(path):
@@ -332,15 +393,40 @@ def _png_has_alpha(path):
 
 
 _img_cache = {}
+_img_missing = set()
 
 
 def clear_image_cache():
     _img_cache.clear()
+    _img_missing.clear()
+
+
+def _exists(path, tries=3):
+    """isfile with retries: external / sleeping drives sometimes report existing files as missing."""
+    if path in _img_missing:
+        return False
+    for i in range(tries):
+        if os.path.isfile(path):
+            return True
+        time.sleep(0.2 * (i + 1))
+    _img_missing.add(path)
+    print(f"[R5] texture not found: {path}")
+    return False
+
+
+def _load_image(path, tries=3):
+    for i in range(tries):
+        try:
+            return bpy.data.images.load(path, check_existing=True)
+        except RuntimeError:
+            time.sleep(0.3 * (i + 1))
+    print(f"[R5] could not read texture: {path}")
+    return None
 
 
 def _image(path, non_color):
     """Load an image only once, even if it is copied into several folders."""
-    if not path or not os.path.isfile(path):
+    if not path or not _exists(path):
         return None
     try:
         key = f"{os.path.basename(path).lower()}|{os.path.getsize(path)}"
@@ -355,7 +441,9 @@ def _image(path, non_color):
             pass
     img = next((i for i in bpy.data.images if i.get("apx_key") == key), None)
     if img is None:
-        img = bpy.data.images.load(path, check_existing=True)
+        img = _load_image(path)
+        if img is None:
+            return None
         img["apx_key"] = key
     if non_color:
         try:
@@ -470,16 +558,18 @@ def get_material(cast, h, settings):
     x = -1100
     y = 400
 
-    # Role of each texture: file name first (Legion+ puts the AO in "emissive"), then slot name
-    roles = {}
-    for slot, h2 in cm.slots.items():
-        p = cast.texture_path(h2)
-        role = role_from_filename(p)
-        if role is None:
-            role = _SLOT.get(slot.lower().replace("texture", ""), slot.lower())
-            if role == "emissive" and not _looks_emissive(name):
-                role = "emissive?"
-        roles.setdefault(role, h2)
+    # Role of each texture: file names first, then the (positional) slot names
+    roles, unnamed = texture_roles(cast, cm, name)
+    overlay = is_overlay(name)
+    if overlay and "opacity" not in roles:
+        # Decals keep their opacity in a separate grey-scale texture (opacityMultiply). With hashed file
+        # names, look for it in the extra slots.
+        for slot, h2 in unnamed:
+            if slot.lower() in ("emissive", "ao", "cavity"):
+                img = _image(cast.texture_path(h2), True)
+                if img is not None and _mask_like(img):
+                    roles["opacity"] = h2
+                    break
 
     def tex(role, non_color):
         nonlocal y
@@ -494,7 +584,6 @@ def get_material(cast, h, settings):
         y -= 300
         return n, cast.texture_path(h2)
 
-    overlay = is_overlay(name)
     vctint = is_vctint(name)
     col_attr = None
     if overlay or vctint:
@@ -505,7 +594,12 @@ def get_material(cast, h, settings):
     alb, alb_path = tex("albedo", False)
     if alb is not None:
         nt.nodes.active = alb       # Solid > Texture shading shows the active image node
-    spec, _ = tex("specular", False)
+    elif "albedo" in roles:
+        mat["apx_cast"] = 0         # texture unreadable right now (drive?): rebuilt on the next import
+    # Blend materials (walls, ground): the last exported slot is not always the specular of layer 1
+    # (bright masks -> white chrome); they are never metals anyway.
+    blend = "albedo2" in roles or is_blend_material(name)
+    spec = None if blend else tex("specular", False)[0]
     base_out = alb.outputs["Color"] if alb else None
     if base_out is not None and vctint and col_attr is not None:
         mul = _mix_rgba(nt, (x + 300, y + 450), "MULTIPLY")
@@ -540,17 +634,29 @@ def get_material(cast, h, settings):
 
     # Transparency
     mode = settings.cast_alpha_mode
+    op, _ = tex("opacity", True)
     if alb and mode != "NEVER":
         if overlay:
-            # Overlay: texture alpha x vertex color alpha, smooth blending
+            # Overlay: albedo alpha x opacity texture x vertex color alpha, smooth blending
+            def mul(a, b, dy):
+                m = nt.nodes.new("ShaderNodeMath"); m.operation = "MULTIPLY"; m.location = (x + 300, y + dy)
+                links.new(a, m.inputs[0]); links.new(b, m.inputs[1])
+                return m.outputs[0]
             a = alb.outputs["Alpha"]
+            if op is not None:
+                a = mul(a, op.outputs["Color"], 750)
             if col_attr is not None:
-                m = nt.nodes.new("ShaderNodeMath"); m.operation = "MULTIPLY"; m.location = (x + 300, y + 600)
-                links.new(a, m.inputs[0]); links.new(col_attr.outputs["Alpha"], m.inputs[1])
-                a = m.outputs[0]
+                a = mul(a, col_attr.outputs["Alpha"], 600)
             links.new(a, bsdf.inputs["Alpha"])
             _set_render_method(mat, "BLENDED")
             mat.use_backface_culling = True
+            if hasattr(mat, "use_transparency_overlap"):
+                mat.use_transparency_overlap = False    # depth-sorted: no see-through on overlapping layers
+            if op is not None:
+                # Solid mode cannot apply the separate opacity mask: the decal would be an opaque patch
+                # (white grime squares on buildings). Show it as a fully transparent viewport colour instead.
+                nt.nodes.active = bsdf
+                mat.diffuse_color = (0.5, 0.5, 0.5, 0.0)
         elif (mode == "ALWAYS" or _CUTOUT_RE.search(name.lower())) and _png_has_alpha(alb_path):
             # Hard cutout (alpha clip): no noise / flickering in the viewport
             clip = nt.nodes.new("ShaderNodeMath"); clip.operation = "GREATER_THAN"; clip.location = (x + 300, y + 600)
@@ -581,7 +687,6 @@ def get_material(cast, h, settings):
         if "Emission Strength" in bsdf.inputs:
             bsdf.inputs["Emission Strength"].default_value = 1.0
 
-    op, _ = tex("opacity", True)
     if op and mode != "NEVER" and not overlay:
         links.new(op.outputs["Color"], bsdf.inputs["Alpha"])
         _set_render_method(mat, "DITHERED")

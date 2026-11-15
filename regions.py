@@ -193,7 +193,7 @@ def ensure_clip_modifiers(scene):
 # --------------------------------------------------------------------------
 def add_zones(scene, zones, unit, offset):
     """Create POIs from the zones read in the entity files."""
-    s = scene.apx_settings
+    s = scene.r5_settings
     existing = {p.name for p in s.pois}
     named = [z for z in zones if z.kind == "named"]
     named_pos = np.array([z.origin for z in named], dtype=np.float64).reshape(-1, 3)
@@ -247,7 +247,7 @@ def map_bounds(scene):
 
 
 def add_grid(scene, n):
-    s = scene.apx_settings
+    s = scene.r5_settings
     lo, hi = map_bounds(scene)
     if lo is None:
         return 0
@@ -271,11 +271,11 @@ def add_grid(scene, n):
 # --------------------------------------------------------------------------
 class R5_OT_region_poi(bpy.types.Operator):
     """Show only the selected point of interest (everything else is hidden, nothing is re-imported)"""
-    bl_idname = "apx.region_poi"
+    bl_idname = "r5.region_poi"
     bl_label = "Show only this POI"
 
     def execute(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         if not (0 <= s.poi_index < len(s.pois)):
             self.report({"WARNING"}, "Select a POI in the list")
             return {"CANCELLED"}
@@ -287,18 +287,18 @@ class R5_OT_region_poi(bpy.types.Operator):
 
 class R5_OT_region_cursor(bpy.types.Operator):
     """Show only a disc around the 3D cursor"""
-    bl_idname = "apx.region_cursor"
+    bl_idname = "r5.region_cursor"
     bl_label = "Region around 3D cursor"
 
     def execute(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         set_region(context.scene, context.scene.cursor.location.copy(), s.poi_default_radius * s.region_scale)
         return {"FINISHED"}
 
 
 class R5_OT_region_clear(bpy.types.Operator):
     """Show the whole map again"""
-    bl_idname = "apx.region_clear"
+    bl_idname = "r5.region_clear"
     bl_label = "Whole map"
 
     def execute(self, context):
@@ -308,11 +308,11 @@ class R5_OT_region_clear(bpy.types.Operator):
 
 class R5_OT_poi_goto(bpy.types.Operator):
     """Move the 3D view above the selected POI"""
-    bl_idname = "apx.poi_goto"
+    bl_idname = "r5.poi_goto"
     bl_label = "Go to POI"
 
     def execute(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         if not (0 <= s.poi_index < len(s.pois)):
             return {"CANCELLED"}
         p = s.pois[s.poi_index]
@@ -331,11 +331,11 @@ class R5_OT_poi_goto(bpy.types.Operator):
 
 class R5_OT_poi_add(bpy.types.Operator):
     """Add a POI at the 3D cursor"""
-    bl_idname = "apx.poi_add"
+    bl_idname = "r5.poi_add"
     bl_label = "Add POI at cursor"
 
     def execute(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         p = s.pois.add()
         p.name = f"POI {len(s.pois)}"
         p.kind = "user"
@@ -347,11 +347,11 @@ class R5_OT_poi_add(bpy.types.Operator):
 
 class R5_OT_poi_remove(bpy.types.Operator):
     """Remove the selected POI from the list"""
-    bl_idname = "apx.poi_remove"
+    bl_idname = "r5.poi_remove"
     bl_label = "Remove POI"
 
     def execute(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         if 0 <= s.poi_index < len(s.pois):
             s.pois.remove(s.poi_index)
             s.poi_index = min(s.poi_index, len(s.pois) - 1)
@@ -360,11 +360,11 @@ class R5_OT_poi_remove(bpy.types.Operator):
 
 class R5_OT_poi_grid(bpy.types.Operator):
     """Add grid sectors (A1, B1...) covering the map to the POI list"""
-    bl_idname = "apx.poi_grid"
+    bl_idname = "r5.poi_grid"
     bl_label = "Add grid sectors"
 
     def execute(self, context):
-        n = add_grid(context.scene, context.scene.apx_settings.grid_size)
+        n = add_grid(context.scene, context.scene.r5_settings.grid_size)
         if not n:
             self.report({"WARNING"}, "Load a map first")
             return {"CANCELLED"}

@@ -9,15 +9,15 @@ class _Base:
     bl_category = "R5 Map Loader"
 
 
-class APX_PT_import(_Base, bpy.types.Panel):
+class R5_PT_import(_Base, bpy.types.Panel):
     bl_label = "Import"
-    bl_idname = "APX_PT_import"
+    bl_idname = "R5_PT_import"
 
     def draw(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         col = self.layout.column()
         col.prop(s, "models_dir", text="Models")
-        col.operator("apx.import_map", icon="IMPORT")
+        col.operator("r5.import_map", icon="IMPORT")
         col.prop(s, "instancing_mode", text="")
         box = col.box()
         box.label(text="Entities (dynamic props, POIs)", icon="OUTLINER_OB_EMPTY")
@@ -55,14 +55,14 @@ class APX_PT_import(_Base, bpy.types.Panel):
             box.prop(s, "region_radius")
 
 
-class APX_PT_visibility(_Base, bpy.types.Panel):
+class R5_PT_visibility(_Base, bpy.types.Panel):
     bl_label = "Visibility"
-    bl_idname = "APX_PT_visibility"
+    bl_idname = "R5_PT_visibility"
 
     def draw(self, context):
         from . import visibility
         from .castfile import GROUPS
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         counts = visibility.counts()
         col = self.layout.column()
         for g, label in GROUPS:
@@ -70,37 +70,37 @@ class APX_PT_visibility(_Base, bpy.types.Panel):
             hidden = getattr(s, f"hide_{g}")
             row.prop(s, f"hide_{g}", text=f"{label} ({counts.get(g, 0)})", toggle=True,
                      icon="HIDE_ON" if hidden else "HIDE_OFF")
-            op = row.operator("apx.select_group", text="", icon="RESTRICT_SELECT_OFF")
+            op = row.operator("r5.select_group", text="", icon="RESTRICT_SELECT_OFF")
             op.group = g
         col.label(text="Pressed = hidden", icon="INFO")
 
 
-class APX_PT_models(_Base, bpy.types.Panel):
+class R5_PT_models(_Base, bpy.types.Panel):
     bl_label = "Prop models"
-    bl_idname = "APX_PT_models"
-    bl_parent_id = "APX_PT_visibility"
+    bl_idname = "R5_PT_models"
+    bl_parent_id = "R5_PT_visibility"
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         col = self.layout.column()
         row = col.row(align=True)
         row.prop(s, "model_filter", text="", icon="VIEWZOOM")
-        op = row.operator("apx.hide_models", text="", icon="HIDE_ON")
+        op = row.operator("r5.hide_models", text="", icon="HIDE_ON")
         op.hide = True
-        op = row.operator("apx.hide_models", text="", icon="HIDE_OFF")
+        op = row.operator("r5.hide_models", text="", icon="HIDE_OFF")
         op.hide = False
         col.template_list("R5_UL_models", "", bpy.data, "objects", s, "model_index", rows=8)
         col.label(text="Count = placements. Eye = viewport, camera = render", icon="INFO")
 
 
-class APX_PT_regions(_Base, bpy.types.Panel):
+class R5_PT_regions(_Base, bpy.types.Panel):
     bl_label = "Regions / POI"
-    bl_idname = "APX_PT_regions"
+    bl_idname = "R5_PT_regions"
 
     def draw(self, context):
         from . import regions
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         col = self.layout.column()
         active = regions.region_active(context.scene)
         if active:
@@ -111,43 +111,43 @@ class APX_PT_regions(_Base, bpy.types.Panel):
         row = col.row()
         row.template_list("R5_UL_pois", "", s, "pois", s, "poi_index", rows=6)
         side = row.column(align=True)
-        side.operator("apx.poi_add", text="", icon="ADD")
-        side.operator("apx.poi_remove", text="", icon="REMOVE")
+        side.operator("r5.poi_add", text="", icon="ADD")
+        side.operator("r5.poi_remove", text="", icon="REMOVE")
         side.separator()
-        side.operator("apx.poi_goto", text="", icon="VIEW_CAMERA")
+        side.operator("r5.poi_goto", text="", icon="VIEW_CAMERA")
         if 0 <= s.poi_index < len(s.pois):
             p = s.pois[s.poi_index]
             col.prop(p, "radius")
         col.prop(s, "region_scale")
         row = col.row(align=True)
-        row.operator("apx.region_poi", icon="SELECT_SUBTRACT")
-        row.operator("apx.region_clear", icon="WORLD")
-        col.operator("apx.region_cursor", icon="PIVOT_CURSOR")
+        row.operator("r5.region_poi", icon="SELECT_SUBTRACT")
+        row.operator("r5.region_clear", icon="WORLD")
+        col.operator("r5.region_cursor", icon="PIVOT_CURSOR")
         row = col.row(align=True)
         row.prop(s, "grid_size")
-        row.operator("apx.poi_grid", icon="MESH_GRID")
+        row.operator("r5.poi_grid", icon="MESH_GRID")
         col.prop(s, "poi_default_radius")
 
 
-class APX_PT_lod(_Base, bpy.types.Panel):
+class R5_PT_lod(_Base, bpy.types.Panel):
     bl_label = "LOD & streaming"
-    bl_idname = "APX_PT_lod"
+    bl_idname = "R5_PT_lod"
 
     def draw_header(self, context):
-        self.layout.prop(context.scene.apx_settings, "use_lod", text="")
+        self.layout.prop(context.scene.r5_settings, "use_lod", text="")
 
     def draw(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         col = self.layout.column()
         if not s.use_lod:
             col.label(text="LODs disabled", icon="INFO")
             col.prop(s, "forced_lod")
-            col.operator("apx.update_lods", icon="FILE_REFRESH")
+            col.operator("r5.update_lods", icon="FILE_REFRESH")
             return
         col.prop(s, "lod_source")
         row = col.row(align=True)
         row.prop(s, "lod_auto_update", toggle=True)
-        row.operator("apx.update_lods", text="", icon="FILE_REFRESH")
+        row.operator("r5.update_lods", text="", icon="FILE_REFRESH")
         col.prop(s, "lod_distances")
         col.prop(s, "lod_bias")
         col.prop(s, "lod_size_scaling")
@@ -176,16 +176,16 @@ class APX_PT_lod(_Base, bpy.types.Panel):
         box.prop(s, "update_interval")
         box.prop(s, "update_move_threshold")
         box.prop(s, "update_angle_threshold")
-        col.operator("apx.show_all", icon="HIDE_OFF")
+        col.operator("r5.show_all", icon="HIDE_OFF")
 
 
-class APX_PT_lod_import(_Base, bpy.types.Panel):
+class R5_PT_lod_import(_Base, bpy.types.Panel):
     bl_label = "LOD generation (at import)"
-    bl_parent_id = "APX_PT_lod"
+    bl_parent_id = "R5_PT_lod"
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         col = self.layout.column()
         col.prop(s, "max_lods")
         col.prop(s, "auto_generate_lods")
@@ -194,12 +194,12 @@ class APX_PT_lod_import(_Base, bpy.types.Panel):
             col.prop(s, "auto_lod_min_faces")
 
 
-class APX_PT_sky(_Base, bpy.types.Panel):
+class R5_PT_sky(_Base, bpy.types.Panel):
     bl_label = "Sky"
-    bl_idname = "APX_PT_sky"
+    bl_idname = "R5_PT_sky"
 
     def draw(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         col = self.layout.column()
         col.prop(s, "sky_mode", text="")
         if s.sky_mode == "PROCEDURAL":
@@ -210,8 +210,13 @@ class APX_PT_sky(_Base, bpy.types.Panel):
                 col.prop(s, "sky_sun_rotation")
             col.prop(s, "sky_haze")
         else:
-            col.prop(s, "sky_image", text="Panorama" if s.sky_mode == "IMAGE" else "One face")
+            label = {"IMAGE": "Panorama", "DOME": "Dome image"}.get(s.sky_mode, "One face")
+            col.prop(s, "sky_image", text=label)
             col.prop(s, "sky_image_rotation")
+            if s.sky_mode == "DOME":
+                col.prop(s, "sky_dome_projection", text="")
+                col.prop(s, "sky_dome_horizon")
+                col.prop(s, "sky_dome_mirror")
             if s.sky_mode == "CUBEMAP":
                 col.prop(s, "sky_cubemap_y_up")
                 col.prop(s, "sky_panorama_width")
@@ -221,22 +226,22 @@ class APX_PT_sky(_Base, bpy.types.Panel):
                 col.prop(s, "sky_sun_rotation")
         col.prop(s, "sky_strength")
         col.prop(s, "sky_sun_strength")
-        col.operator("apx.setup_sky", icon="WORLD_DATA")
+        col.operator("r5.setup_sky", icon="WORLD_DATA")
         if not s.map_sun_json:
             col.label(text="The map sky/sun live in the compressed _env.ent", icon="INFO")
 
 
-class APX_PT_render(_Base, bpy.types.Panel):
+class R5_PT_render(_Base, bpy.types.Panel):
     bl_label = "Render (Cycles)"
-    bl_idname = "APX_PT_render"
+    bl_idname = "R5_PT_render"
 
     def draw(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         col = self.layout.column()
         row = col.row(align=True)
-        op = row.operator("apx.setup_cycles", text="Cycles preview", icon="SHADING_RENDERED")
+        op = row.operator("r5.setup_cycles", text="Cycles preview", icon="SHADING_RENDERED")
         op.preset = "PREVIEW"
-        op = row.operator("apx.setup_cycles", text="Cycles final", icon="RENDER_STILL")
+        op = row.operator("r5.setup_cycles", text="Cycles final", icon="RENDER_STILL")
         op.preset = "FINAL"
         col.prop(s, "cycles_samples_preview")
         col.prop(s, "cycles_samples_final")
@@ -252,23 +257,23 @@ class APX_PT_render(_Base, bpy.types.Panel):
         col.label(text="Tip: Regions / POI renders only part of the map", icon="INFO")
 
 
-class APX_PT_optimize(_Base, bpy.types.Panel):
+class R5_PT_optimize(_Base, bpy.types.Panel):
     bl_label = "Optimization"
-    bl_idname = "APX_PT_optimize"
+    bl_idname = "R5_PT_optimize"
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
-        s = context.scene.apx_settings
+        s = context.scene.r5_settings
         col = self.layout.column()
         col.prop(s, "join_meshes")
         col.prop(s, "merge_distance")
         col.prop(s, "dedupe_on_import")
         row = col.row(align=True)
         row.prop(s, "texture_limit", text="Textures")
-        row.operator("apx.texture_limit", text="", icon="CHECKMARK")
-        col.operator("apx.optimize", icon="MODIFIER")
-        col.operator("apx.viewport_setup", icon="VIEW_CAMERA")
-        col.operator("apx.make_real", icon="OUTLINER_OB_MESH")
+        row.operator("r5.texture_limit", text="", icon="CHECKMARK")
+        col.operator("r5.optimize", icon="MODIFIER")
+        col.operator("r5.viewport_setup", icon="VIEW_CAMERA")
+        col.operator("r5.make_real", icon="OUTLINER_OB_MESH")
         models, inst, tris = optimize.library_stats()
         box = col.box()
         box.label(text=f"Unique models: {models}")
@@ -276,8 +281,8 @@ class APX_PT_optimize(_Base, bpy.types.Panel):
         box.label(text=f"LOD0 triangles (unique): {tris:,}")
 
 
-CLASSES = (APX_PT_import, APX_PT_visibility, APX_PT_models, APX_PT_regions, APX_PT_lod, APX_PT_lod_import,
-           APX_PT_sky, APX_PT_render, APX_PT_optimize)
+CLASSES = (R5_PT_import, R5_PT_visibility, R5_PT_models, R5_PT_regions, R5_PT_lod, R5_PT_lod_import,
+           R5_PT_sky, R5_PT_render, R5_PT_optimize)
 
 
 def register():

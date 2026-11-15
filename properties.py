@@ -20,11 +20,25 @@ def _vis_changed(self, context):
     visibility.apply(context.scene)
 
 
+def _sky_changed(self, context):
+    from . import sky
+    w = bpy.data.worlds.get(sky.WORLD)
+    if w is not None and w.get("r5_sky_mode") == "DOME":
+        try:
+            sky.refresh_dome(context.scene)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[R5] sky: {exc}")
+    elif w is not None and context.scene.world == w:
+        for n in w.node_tree.nodes:
+            if n.type == "BACKGROUND":
+                n.inputs["Strength"].default_value = self.sky_strength
+
+
 _TEX_LIMITS = [("OFF", "No limit", ""), ("4096", "4096", ""), ("2048", "2048", ""), ("1024", "1024", ""),
                ("512", "512", "")]
 
 
-class APX_Settings(bpy.types.PropertyGroup):
+class R5_Settings(bpy.types.PropertyGroup):
     # ---------------- Visibility ----------------
     hide_trigger: BoolProperty(name="Hide triggers", default=True, update=_vis_changed,
                                description="toolstrigger, fog volumes...")
@@ -51,9 +65,10 @@ class APX_Settings(bpy.types.PropertyGroup):
         name="Max texture size (viewport)",
         items=[("CLAMP_OFF", "No limit", ""), ("CLAMP_2048", "2048", ""), ("CLAMP_1024", "1024", ""),
                ("CLAMP_512", "512", ""), ("CLAMP_256", "256", "")],
-        default="CLAMP_1024",
-        description="A full map uses thousands of 2K textures: without a limit video memory fills up and some "
-                    "textures stop showing")
+        default="CLAMP_512",
+        description="A full map uses ~4,400 unique textures. Applied on import (only ever lowered). Measured on "
+                    "World's Edge with a 16 GB GPU, Material Preview: no limit = 12 s frames and driver reset, "
+                    "1024 = 13.6 GB, 512 = 6.2 GB at the same speed")
 
     # ---------------- Import ----------------
     models_dir: StringProperty(
@@ -233,13 +248,29 @@ class APX_Settings(bpy.types.PropertyGroup):
         name="Sky",
         items=[("PROCEDURAL", "Procedural sky + sun", "Physical sky (Nishita) with a sun lamp"),
                ("IMAGE", "Panorama / HDRI image", "Equirectangular image"),
-               ("CUBEMAP", "Cubemap (6 faces)", "6 face images, e.g. a sky cubemap exported with RSX")],
+               ("CUBEMAP", "Cubemap (6 faces)", "6 face images, e.g. a sky cubemap exported with RSX"),
+               ("DOME", "In-game sky dome (round image)",
+                "Square image with a round sky: zenith in the centre, horizon on the circle (Apex skybox "
+                "textures)")],
         default="PROCEDURAL")
     sky_image: StringProperty(name="Image", subtype="FILE_PATH",
-                              description="Panorama / HDRI, or ONE of the 6 cubemap faces (the others are found "
-                                          "next to it)")
-    sky_strength: FloatProperty(name="Sky strength", default=1.0, min=0.0, soft_max=10.0)
-    sky_image_rotation: FloatProperty(name="Rotation (°)", default=0.0, soft_min=-180, soft_max=180)
+                              description="Panorama / HDRI, round sky-dome image, or ONE of the 6 cubemap faces "
+                                          "(the others are found next to it)")
+    sky_strength: FloatProperty(name="Sky strength", default=1.0, min=0.0, soft_max=10.0, update=_sky_changed)
+    sky_image_rotation: FloatProperty(name="Rotation (°)", default=0.0, soft_min=-180, soft_max=180,
+                                      update=_sky_changed)
+    sky_dome_projection: EnumProperty(
+        name="Dome projection",
+        items=[("EQUIDISTANT", "Equidistant", "Distance from the centre proportional to the angle from the zenith"),
+               ("EQUISOLID", "Equal area", "Fisheye keeping areas (more room near the horizon)"),
+               ("ORTHO", "Planar (top view)", "Dome seen from above: the horizon is squeezed on the circle")],
+        default="EQUIDISTANT", update=_sky_changed)
+    sky_dome_horizon: FloatProperty(
+        name="Horizon radius", default=1.0, min=0.3, max=1.5, subtype="FACTOR", update=_sky_changed,
+        description="Where the horizon sits in the disc. Lower it when the mountains float above the horizon, "
+                    "raise it when they are cut")
+    sky_dome_mirror: BoolProperty(name="Mirror", default=False, update=_sky_changed,
+                                  description="Flip east / west (images authored as seen from below)")
     sky_cubemap_y_up: BoolProperty(name="Faces authored Y-up", default=True,
                                    description="On for D3D / RSX cubemaps. Off for Z-up faces")
     sky_panorama_width: EnumProperty(name="Panorama width",
@@ -264,10 +295,14 @@ class APX_Settings(bpy.types.PropertyGroup):
 
 
 def register():
-    bpy.utils.register_class(APX_Settings)
-    bpy.types.Scene.apx_settings = bpy.props.PointerProperty(type=APX_Settings)
+    bpy.utils.register_class(R5_Settings)
+    bpy.types.Scene.r5_settings = bpy.props.PointerProperty(type=R5_Settings)
+
+
+CLASSES = (R5_Settings,)
 
 
 def unregister():
-    del bpy.types.Scene.apx_settings
-    bpy.utils.unregister_class(APX_Settings)
+    if hasattr(bpy.types.Scene, "r5_settings"):
+        del bpy.types.Scene.r5_settings
+    bpy.utils.unregister_class(R5_Settings)

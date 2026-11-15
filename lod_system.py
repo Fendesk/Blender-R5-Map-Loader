@@ -92,7 +92,7 @@ def camera_view(scene, frustum=True):
 
 
 def current_view(scene):
-    s = scene.apx_settings
+    s = scene.r5_settings
     if s.lod_source == "CAMERA" and scene.camera is not None:
         return camera_view(scene)
     v = viewport_view()
@@ -214,6 +214,9 @@ def _compute_levels(scene, view, s):
 
 
 def _apply(levels):
+    # Culling switches the instancing off (instance_type NONE) instead of using hide_viewport /
+    # hide_render: every hide_* change re-syncs the whole view layer (~0.2 ms x number of objects, i.e.
+    # hours for 400k empties), whereas instance_type / instance_collection only tag the depsgraph.
     c = _cache
     changed = np.nonzero(levels != c.current)[0]
     try:
@@ -222,16 +225,14 @@ def _apply(levels):
             lv = int(levels[i])
             lods, bounds, _r = c.models[c.model_idx[i]]
             if lv == LEVEL_CULLED:
-                if not o.hide_viewport:
-                    o.hide_viewport = True
-                o.hide_render = True
+                if o.instance_type != "NONE":
+                    o.instance_type = "NONE"
             else:
                 col = bounds if lv >= len(lods) else lods[lv]
                 if o.instance_collection != col:
                     o.instance_collection = col
-                if o.hide_viewport:
-                    o.hide_viewport = False
-                o.hide_render = False
+                if o.instance_type != "COLLECTION":
+                    o.instance_type = "COLLECTION"
             c.current[i] = lv
     except ReferenceError:
         invalidate()
@@ -263,7 +264,7 @@ def update_empties(scene, view):
     _cache.last_view = view
     if len(_cache.objs) == 0:
         return 0
-    return _apply(_compute_levels(scene, view, scene.apx_settings))
+    return _apply(_compute_levels(scene, view, scene.r5_settings))
 
 
 def update_from_eye(scene, eye, force=False):
@@ -293,7 +294,7 @@ def apply_view(scene, view):
 def apply_all(scene):
     """Apply the LOD state right now (empties + Geometry Nodes)."""
     from . import gn_instancer
-    s = scene.apx_settings
+    s = scene.r5_settings
     invalidate()
     n = 0
     if _gn_present():
@@ -325,9 +326,9 @@ TICK = 0.1
 
 def _timer():
     scene = bpy.context.scene
-    if scene is None or not hasattr(scene, "apx_settings"):
+    if scene is None or not hasattr(scene, "r5_settings"):
         return 1.0
-    s = scene.apx_settings
+    s = scene.r5_settings
     if _rendering:
         return 0.5
     try:
@@ -363,6 +364,15 @@ def _timer():
 def _on_load(_dummy):
     invalidate()
     _state.applied = None
+    # A saved map reopened: same video-memory protection as on import
+    try:
+        scene = bpy.context.scene
+        if scene is not None and hasattr(scene, "r5_settings") and scene.r5_settings.setup_viewport_on_import \
+                and (bpy.data.node_groups.get("APX_Instancer") or any("apx_model" in o for o in bpy.data.objects)):
+            from . import optimize
+            optimize.apply_texture_limit(scene.r5_settings.texture_limit)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[R5] load: {exc}")
 
 
 @bpy.app.handlers.persistent
@@ -375,7 +385,7 @@ def _on_undo(_dummy):
 def _render_pre(scene, _dg=None):
     global _rendering
     _rendering = True
-    s = scene.apx_settings
+    s = scene.r5_settings
     from . import gn_instancer
     gn = _gn_present()
     try:
