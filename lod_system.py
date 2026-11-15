@@ -1,13 +1,13 @@
-"""Système de LOD + culling dynamique (désactivable).
+"""Dynamic LOD + culling (can be switched off).
 
-Deux modes d'instanciation :
-  - Geometry Nodes : on déplace seulement la sonde APX_LOD_Probe (position, rotation, champ
-    de vision) ; tout le reste est calculé par les nœuds (voir gn_instancer).
-  - Empties : chaque prop est un empty qui instancie une collection ; niveaux calculés en
-    bloc avec numpy, seuls les props qui changent de niveau sont touchés.
+Two instancing modes:
+  - Geometry Nodes: only the APX_LOD_Probe empty is moved (location, rotation, field of view);
+    the node group does the rest (see gn_instancer).
+  - Empties: every prop is an empty instancing a collection; levels are computed in bulk with
+    numpy and only the props whose level changes are touched.
 
-Culling : hors du champ de vision (frustum), trop petit à l'écran, au-delà d'une distance.
-La mise à jour attend que la vue soit stable (anti-rebond) pour ne pas saccader.
+Culling: outside the field of view (frustum), too small on screen, beyond a distance, outside
+the active region. Updates wait until the view stops moving (debounce) so navigation stays smooth.
 """
 
 import math
@@ -23,7 +23,7 @@ LEVEL_CULLED = -1
 
 
 # --------------------------------------------------------------------------
-# État de la vue
+# View state
 # --------------------------------------------------------------------------
 class View:
     __slots__ = ("eye", "quat", "tanx", "tany", "mode")
@@ -67,7 +67,7 @@ def viewport_view():
     wmx = r3d.window_matrix
     if r3d.is_perspective and abs(wmx[0][0]) > 1e-6 and abs(wmx[1][1]) > 1e-6:
         return View(inv.translation.copy(), inv.to_quaternion(), 1.0 / abs(wmx[0][0]), 1.0 / abs(wmx[1][1]), 1.0)
-    return View(inv.translation.copy(), inv.to_quaternion(), 1.0, 1.0, 0.0)   # ortho : pas de culling
+    return View(inv.translation.copy(), inv.to_quaternion(), 1.0, 1.0, 0.0)   # ortho: no culling
 
 
 def camera_view(scene, frustum=True):
@@ -107,7 +107,7 @@ def current_eye(scene):
 
 
 # --------------------------------------------------------------------------
-# Mode Empties (numpy)
+# Empties mode (numpy)
 # --------------------------------------------------------------------------
 class _Cache:
     def __init__(self):
@@ -165,7 +165,17 @@ def rebuild(scene):
     c.forced_applied = None
 
 
-def _compute_levels(view, s):
+def _region_mask(scene, pos):
+    """True for points outside the active region."""
+    from .regions import REGION
+    r = bpy.data.objects.get(REGION)
+    if r is None or r.scale.z <= 0.5:
+        return np.zeros(len(pos), dtype=bool)
+    d = np.linalg.norm(pos[:, :2] - np.array(r.location[:2], dtype=np.float32), axis=1)
+    return d > r.scale.x
+
+
+def _compute_levels(scene, view, s):
     c = _cache
     if len(c.objs) == 0:
         return np.zeros(0, dtype=np.int32)
@@ -191,14 +201,15 @@ def _compute_levels(view, s):
     if s.cull_small_props and view.mode > 0.25 and s.min_screen_pct > 0:
         culled |= c.size / np.maximum(raw * view.tany, 1e-4) < s.min_screen_pct / 100.0
     if s.use_frustum and view.mode > 0.75:
-        rmat = np.array(view.quat.to_matrix(), dtype=np.float32)    # colonnes = axes de la vue
-        vl = rel @ rmat                                              # coordonnées dans l'espace vue
+        rmat = np.array(view.quat.to_matrix(), dtype=np.float32)    # columns = view axes
+        vl = rel @ rmat                                              # view-space coordinates
         fwd = -vl[:, 2]
         m = s.frustum_margin
         sz = c.size * 1.5
         inside = ((np.abs(vl[:, 0]) <= fwd * view.tanx * m + sz) &
                   (np.abs(vl[:, 1]) <= fwd * view.tany * m + sz) & (fwd >= -sz))
         culled |= ~inside
+    culled |= _region_mask(scene, c.pos)
     return np.where(culled, LEVEL_CULLED, level)
 
 
@@ -229,7 +240,7 @@ def _apply(levels):
 
 
 def apply_forced(scene, level):
-    """LOD désactivé : tous les props au même niveau, sans culling."""
+    """LOD disabled: every prop uses the same level, without culling (the region still applies)."""
     if not _cache.valid:
         rebuild(scene)
     c = _cache
@@ -238,6 +249,7 @@ def apply_forced(scene, level):
         return 0
     nl = c.n_lods[c.model_idx]
     levels = np.minimum(np.full(len(c.objs), level, dtype=np.int32), nl - 1)
+    levels = np.where(_region_mask(scene, c.pos), LEVEL_CULLED, levels)
     n = _apply(levels)
     _cache.forced_applied = level
     _cache.last_view = None
@@ -251,18 +263,18 @@ def update_empties(scene, view):
     _cache.last_view = view
     if len(_cache.objs) == 0:
         return 0
-    return _apply(_compute_levels(view, scene.apx_settings))
+    return _apply(_compute_levels(scene, view, scene.apx_settings))
 
 
-# Compatibilité
 def update_from_eye(scene, eye, force=False):
+    """Compatibility helper: update from an eye position using the current view orientation."""
     v = current_view(scene) or View(Vector(eye), Quaternion(), 1.0, 1.0, 0.0)
     v.eye = Vector(eye)
     return update_empties(scene, v)
 
 
 # --------------------------------------------------------------------------
-# Application globale
+# Global apply
 # --------------------------------------------------------------------------
 def _gn_present():
     from . import gn_instancer
@@ -279,7 +291,7 @@ def apply_view(scene, view):
 
 
 def apply_all(scene):
-    """Applique immédiatement l'état LOD (empties + Geometry Nodes)."""
+    """Apply the LOD state right now (empties + Geometry Nodes)."""
     from . import gn_instancer
     s = scene.apx_settings
     invalidate()
@@ -297,12 +309,12 @@ def apply_all(scene):
 
 
 # --------------------------------------------------------------------------
-# Timer (anti-rebond) & handlers
+# Timer (debounced) & handlers
 # --------------------------------------------------------------------------
 class _State:
-    applied = None      # dernière vue appliquée
-    last_seen = None    # vue au tick précédent
-    changed_at = 0.0    # instant du dernier mouvement
+    applied = None      # last applied view
+    last_seen = None    # view at the previous tick
+    changed_at = 0.0    # time of the last movement
     applied_at = 0.0
 
 
@@ -342,7 +354,7 @@ def _timer():
                 _state.applied = v
                 _state.applied_at = now
     except Exception as exc:  # noqa: BLE001
-        print(f"[APX] LOD timer: {exc}")
+        print(f"[R5] LOD timer: {exc}")
         invalidate()
     return TICK
 
@@ -376,9 +388,10 @@ def _render_pre(scene, _dg=None):
             v = camera_view(scene, frustum=s.render_frustum)
             update_empties(scene, v)
             if gn:
+                gn_instancer.apply_settings(scene, min_screen=s.render_min_screen_pct / 100.0)
                 gn_instancer.set_probe(scene, v.eye, v.quat, v.tanx, v.tany, v.mode)
     except Exception as exc:  # noqa: BLE001
-        print(f"[APX] render_pre: {exc}")
+        print(f"[R5] render_pre: {exc}")
 
 
 @bpy.app.handlers.persistent
@@ -393,7 +406,7 @@ def _render_post(scene, _dg=None):
             from . import gn_instancer
             gn_instancer.apply_settings(scene)
     except Exception as exc:  # noqa: BLE001
-        print(f"[APX] render_post: {exc}")
+        print(f"[R5] render_post: {exc}")
 
 
 _HANDLERS = (

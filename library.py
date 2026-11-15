@@ -1,12 +1,12 @@
-"""Bibliothèque de modèles : indexation des fichiers exportés (Legion+ etc.),
-import unique par modèle, construction des collections LOD.
+"""Model library: indexes the exported files (RSX, Legion+...), imports each model once and
+builds its LOD collections.
 
-Chaque modèle unique est importé UNE seule fois dans une collection cachée
-"APX_Library". Chaque niveau de LOD est une sous-collection
-"<modele>__LOD<n>". Les props de la map sont des instances de collection
-(empties) -> la géométrie n'est jamais dupliquée en mémoire.
+Each unique model is imported ONCE into the hidden "APX_Library" collection. Every LOD level
+is a sub-collection "<model>__LOD<n>". Map props are collection instances, so geometry is
+never duplicated in memory.
 """
 
+import math
 import os
 import re
 
@@ -14,6 +14,8 @@ import bpy
 import bmesh
 import numpy as np
 from mathutils import Matrix
+
+from .castfile import GROUP_KEY, is_fx_model
 
 SUPPORTED_EXT = (".cast", ".glb", ".gltf", ".fbx", ".obj", ".semodel", ".smd")
 LIB_COLLECTION = "APX_Library"
@@ -23,10 +25,10 @@ _LOD_OBJ_RE = re.compile(r"lod[_\-]?(\d+)", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------
-# Indexation du dossier de modèles
+# Model folder index
 # --------------------------------------------------------------------------
 def build_index(root):
-    """Retourne {cle_modele: {lod: chemin}}. Préférence d'extension = ordre SUPPORTED_EXT."""
+    """Return {model_key: {lod: path}}. Extension preference = SUPPORTED_EXT order."""
     index = {}
     prio = {e: i for i, e in enumerate(SUPPORTED_EXT)}
     for dirpath, _dirs, files in os.walk(root):
@@ -57,7 +59,7 @@ def get_library_collection(scene):
         lib = bpy.data.collections.new(LIB_COLLECTION)
     if lib.name not in scene.collection.children:
         scene.collection.children.link(lib)
-    # Exclure du view layer : la bibliothèque n'est ni affichée ni évaluée directement
+    # Excluded from the view layer: the library is never drawn or evaluated directly
     _set_excluded(bpy.context.view_layer.layer_collection, lib.name, True)
     return lib
 
@@ -77,7 +79,7 @@ def lod_collection_name(key, lod):
 
 
 def get_model_lods(key):
-    """Retourne la liste ordonnée des collections LOD existantes pour un modèle."""
+    """Ordered list of the existing LOD collections of a model."""
     out = []
     i = 0
     while True:
@@ -94,10 +96,10 @@ def bounds_collection(key):
 
 
 # --------------------------------------------------------------------------
-# Import d'un fichier
+# File import
 # --------------------------------------------------------------------------
 def _import_file(path):
-    """Importe un fichier et renvoie la liste des nouveaux objets."""
+    """Import one file and return the new objects."""
     before = set(bpy.data.objects)
     ext = os.path.splitext(path)[1].lower()
     if ext in (".glb", ".gltf"):
@@ -110,22 +112,21 @@ def _import_file(path):
         else:
             bpy.ops.import_scene.obj(filepath=path)
     elif ext == ".cast":
-        # Lecteur intégré (pas besoin de l'addon Cast)
-        from . import castfile
+        from . import castfile      # built-in reader (the Cast add-on is not needed)
         return castfile.import_model_cast(path, bpy.context.scene.apx_settings)
     elif ext == ".semodel":
         if not hasattr(bpy.ops.import_scene, "semodel"):
-            raise RuntimeError("Addon 'SEModel' requis pour les fichiers .semodel")
+            raise RuntimeError("The 'SEModel' add-on is required for .semodel files")
         bpy.ops.import_scene.semodel(filepath=path)
     elif ext == ".smd":
         if not hasattr(bpy.ops.import_scene, "smd"):
-            raise RuntimeError("Addon 'Blender Source Tools' requis pour les fichiers .smd")
+            raise RuntimeError("The 'Blender Source Tools' add-on is required for .smd files")
         bpy.ops.import_scene.smd(filepath=path)
     return [o for o in bpy.data.objects if o not in before]
 
 
 def _strip_to_meshes(objs):
-    """Garde uniquement les meshes, transformations appliquées, sans armature."""
+    """Keep meshes only, with transforms applied and no armature."""
     meshes = []
     for o in objs:
         if o.type == "MESH":
@@ -141,7 +142,7 @@ def _strip_to_meshes(objs):
     for o in objs:
         if o.type != "MESH":
             bpy.data.objects.remove(o, do_unlink=True)
-    # Applique la transformation dans la géométrie (le modèle doit être à l'identité)
+    # Bake the transform into the geometry (the model must sit at identity)
     for o in meshes:
         if o.data.users > 1:
             o.data = o.data.copy()
@@ -151,7 +152,7 @@ def _strip_to_meshes(objs):
 
 
 def _join(objs, name):
-    """Fusionne plusieurs meshes en un seul objet sans bpy.ops (rapide, sans contexte)."""
+    """Merge several meshes into one object without bpy.ops (fast, no context needed)."""
     if len(objs) == 1:
         objs[0].name = name
         objs[0].data.name = name
@@ -199,8 +200,8 @@ def _merge_by_distance(obj, dist):
 
 
 def _make_decimated(src_obj, ratio, name):
-    """Crée une copie décimée (LOD généré automatiquement)."""
-    tmp = bpy.data.objects.new("__apx_tmp", src_obj.data)
+    """Create a decimated copy (automatically generated LOD)."""
+    tmp = bpy.data.objects.new("__r5_tmp", src_obj.data)
     bpy.context.scene.collection.objects.link(tmp)
     mod = tmp.modifiers.new("dec", "DECIMATE")
     mod.ratio = ratio
@@ -209,19 +210,26 @@ def _make_decimated(src_obj, ratio, name):
     me = bpy.data.meshes.new_from_object(tmp.evaluated_get(dg))
     me.name = name
     bpy.data.objects.remove(tmp, do_unlink=True)
+    # Decimation carries stale custom normals (some flipped / zero length -> black patches):
+    # replace them with clean smooth normals computed from the simplified geometry
+    if len(me.vertices) and len(me.polygons):
+        vn = np.empty(len(me.vertices) * 3, np.float32)
+        me.vertex_normals.foreach_get("vector", vn)
+        me.polygons.foreach_set("use_smooth", np.ones(len(me.polygons), dtype=bool))
+        me.normals_split_custom_set_from_vertices(vn.reshape(-1, 3))
     obj = bpy.data.objects.new(name, me)
-    if "apx_group" in src_obj:
-        obj["apx_group"] = src_obj["apx_group"]
+    if GROUP_KEY in src_obj:
+        obj[GROUP_KEY] = src_obj[GROUP_KEY]
     return obj
 
 
 # --------------------------------------------------------------------------
-# API principale
+# Main API
 # --------------------------------------------------------------------------
 def ensure_model(key, files, settings, scene):
-    """Importe un modèle (tous ses LODs) s'il n'est pas déjà dans la bibliothèque.
+    """Import a model (all its LODs) unless it is already in the library.
 
-    files : {lod: chemin}. Renvoie la liste des collections LOD (peut être vide).
+    files: {lod: path}. Returns the list of LOD collections (may be empty).
     """
     existing = get_model_lods(key)
     if existing:
@@ -233,8 +241,9 @@ def ensure_model(key, files, settings, scene):
 
     corr = _axis_correction(settings.axis_correction)
     unit = settings.unit_scale
+    fx = is_fx_model(key)
 
-    lod_objects = {}   # lod -> objet mesh
+    lod_objects = {}   # lod -> mesh objects
 
     max_lod = settings.max_lods if settings.use_lod else 1
     for lod in sorted(files.keys()):
@@ -243,13 +252,17 @@ def ensure_model(key, files, settings, scene):
         try:
             new = _import_file(files[lod])
         except Exception as exc:  # noqa: BLE001
-            print(f"[APX] Échec import {files[lod]} : {exc}")
+            print(f"[R5] Import failed {files[lod]}: {exc}")
             continue
         meshes = _strip_to_meshes(new)
         if not meshes:
             continue
+        if fx:
+            # Light shaft / atmosphere volume: the whole model goes to the "fx" group
+            for o in meshes:
+                o[GROUP_KEY] = "fx"
 
-        # Fichier unique contenant plusieurs LODs dans les noms d'objets ?
+        # A single file holding several LODs in its object names?
         groups = {}
         for o in meshes:
             m = _LOD_OBJ_RE.search(o.name)
@@ -259,9 +272,9 @@ def ensure_model(key, files, settings, scene):
                 for o in objs:
                     bpy.data.objects.remove(o, do_unlink=True)
                 continue
-            # Les objets triggers/outils (apx_group) restent séparés pour pouvoir être cachés
-            normal = [o for o in objs if "apx_group" not in o]
-            special = [o for o in objs if "apx_group" in o]
+            # Grouped objects (triggers, tools...) stay separate so they can be hidden
+            normal = [o for o in objs if GROUP_KEY not in o]
+            special = [o for o in objs if GROUP_KEY in o]
             if settings.join_meshes and normal:
                 normal = [_join(normal, lod_collection_name(key, glod))]
             lod_objects[glod] = normal + special
@@ -270,10 +283,9 @@ def ensure_model(key, files, settings, scene):
         bpy.data.collections.remove(model_root)
         return []
 
-    # Renumérotation contiguë 0..n
-    ordered = [lod_objects[k] for k in sorted(lod_objects)]
+    ordered = [lod_objects[k] for k in sorted(lod_objects)]     # contiguous 0..n
 
-    # Correction d'axe + échelle : appliquée UNE fois dans la géométrie
+    # Axis correction + scale: baked ONCE into the geometry
     xf = Matrix.Scale(unit, 4) @ corr
     for objs in ordered:
         for o in objs:
@@ -281,8 +293,8 @@ def ensure_model(key, files, settings, scene):
             if settings.merge_distance > 0:
                 _merge_by_distance(o, settings.merge_distance)
 
-    # LODs générés automatiquement si le modèle n'en a qu'un seul
-    if settings.use_lod and settings.auto_generate_lods and len(ordered) == 1:
+    # Generated LODs when the model only has one
+    if settings.use_lod and settings.auto_generate_lods and len(ordered) == 1 and not fx:
         ratios = [settings.auto_lod_ratio ** i for i in range(1, settings.max_lods)]
         base = ordered[0]
         tri_count = sum(len(o.data.polygons) for o in base)
@@ -307,7 +319,7 @@ def ensure_model(key, files, settings, scene):
                 radius = max(radius, float(np.sqrt((co.reshape(-1, 3) ** 2).sum(1)).max()))
         lods.append(col)
 
-    # Niveau "boîte englobante" (très loin) : réutilise la géométrie du dernier LOD
+    # "Bounding box" level (very far): reuses the last LOD geometry
     if settings.use_lod and settings.use_bounds_level:
         bcol = bpy.data.collections.new(f"{key}__BOUNDS")
         model_root.children.link(bcol)
@@ -318,6 +330,8 @@ def ensure_model(key, files, settings, scene):
             bcol.objects.link(b)
 
     model_root["apx_radius"] = max(radius, 0.01)
+    if fx:
+        model_root[GROUP_KEY] = "fx"
     for c in lods:
         c["apx_radius"] = model_root["apx_radius"]
     return lods
@@ -332,7 +346,6 @@ def model_radius(key):
 
 
 def _axis_correction(mode):
-    import math
     if mode == "X90":
         return Matrix.Rotation(math.radians(90), 4, "X")
     if mode == "X-90":

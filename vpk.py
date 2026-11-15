@@ -1,9 +1,9 @@
-"""Lecture des VPK Respawn (v2.3, R5Reloaded / Apex) : liste des fichiers et extraction
-des entrées stockées sans compression (c'est le cas des .ent *_script / *_snd / *_spawn
-dans les VPK serveur de R5Reloaded). Les entrées compressées (LZHAM) sont signalées.
+"""Respawn VPK reader (v2.3, R5Reloaded / Apex): lists the files and extracts the entries that
+are stored without compression (this is the case of the *_script / *_snd / *_spawn .ent files
+in R5Reloaded server VPKs). Compressed (LZHAM) entries are reported and skipped.
 
-Le fichier à ouvrir est le répertoire :  vpk/englishserver_<map>.bsp.pak000_dir.vpk
-Les données sont dans :                  vpk/server_<map>.bsp.pak000_000.vpk
+The file to open is the directory:  vpk/englishserver_<map>.bsp.pak000_dir.vpk
+The data lives in:                  vpk/server_<map>.bsp.pak000_000.vpk
 """
 
 import os
@@ -36,9 +36,9 @@ def read_dir(dir_path):
         b = f.read()
     magic, major, minor, _dsize, _ssize = struct.unpack_from("<IHHII", b, 0)
     if magic != 0x55AA1234:
-        raise ValueError(f"{os.path.basename(dir_path)} n'est pas un VPK")
+        raise ValueError(f"{os.path.basename(dir_path)} is not a VPK")
     if (major, minor) != (2, 3):
-        raise ValueError(f"VPK version {major}.{minor} non supportée (attendu 2.3 Respawn)")
+        raise ValueError(f"VPK version {major}.{minor} is not supported (expected Respawn 2.3)")
     off = 16
 
     def rs():
@@ -85,7 +85,7 @@ def archive_path(dir_path, pack):
 
 def read_entry(dir_path, entry):
     if entry.compressed:
-        raise ValueError(f"{entry.path} est compressé dans le VPK (LZHAM) : extrais-le avec un outil VPK")
+        raise ValueError(f"{entry.path} is compressed in the VPK (LZHAM): extract it with a VPK tool")
     out = bytearray()
     with open(archive_path(dir_path, entry.pack), "rb") as f:
         for ao, cs, _us in entry.chunks:
@@ -95,7 +95,7 @@ def read_entry(dir_path, entry):
 
 
 def read_ents(dir_path, kinds=("script",)):
-    """Renvoie [(nom, texte)] des .ent demandés, et la liste des .ent ignorés (compressés)."""
+    """Return [(name, text)] for the requested .ent files, and the list of skipped (compressed) ones."""
     found, skipped = [], []
     for e in read_dir(dir_path):
         if not e.path.lower().endswith(".ent"):
