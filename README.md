@@ -69,7 +69,7 @@ World's Edge with a 16 GB RTX 5080, Material Preview:
 | 1024 | 35 fps | 8.8 fps | 13.6 GB |
 | 512 | 38 fps | 8.7 fps | 6.2 GB |
 
-*Empties* instancing on a full map (433k objects) updates its LODs but Blender draws ~1 fps with that many objects:
+*Empties* instancing on a full map (World Edge = 433k objects) updates its LODs but Blender draws ~1 fps with that many objects:
 use Geometry Nodes for a full map and keep Empties for *Import an area only*.
 
 ## Notes
