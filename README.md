@@ -1,4 +1,4 @@
-﻿# Blender R5 Map Loader 0.12.0 (Blender 4.2+, Windows)
+﻿# Blender R5 Map Loader 0.12.0 (Blender 4.2+)
 
 Loads R5Reloaded / Apex Legends maps into Blender, **straight from the game install** or from Legion+ exports:
 map geometry, static props, dynamic props, points of interest and the map's sun. The add-on handles instancing,
