@@ -12,7 +12,7 @@ from mathutils import Euler, Vector
 
 from . import castfile, gn_instancer, library, lod_system, optimize, placement, regions, visibility, vpk
 
-PLACEMENT_EXT = (".ent", ".json", ".csv", ".mprt")
+PLACEMENT_EXT = (".ent", ".json", ".csv", ".mprt", ".nut")
 
 
 def exclude_regex(text):
@@ -45,7 +45,21 @@ def _get_child_collection(parent, name):
 
 
 def _resolve_models_dir(s, paths):
+    if any(p.lower().endswith(".nut") for p in paths):
+        # ReMap maps use props of any map: the chosen models folder(s) + every map cached by Import from game
+        from . import game_import
+        d = bpy.path.abspath(s.models_dir) if s.models_dir else ""
+        dirs = [x.strip() for x in d.split(";") if x.strip() and os.path.isdir(x.strip())]
+        dirs += [x for x in game_import.all_cached_model_dirs(s) if x not in dirs]
+        if dirs:
+            return ";".join(dirs)
+        raise RuntimeError("No models for this .nut map: import a map with 'Import from game' first (its models "
+                           "are reused), or set the Models folder")
     d = bpy.path.abspath(s.models_dir) if s.models_dir else ""
+    if d and ";" in d:          # several folders (game import: export + fallback caches)
+        dirs = [p.strip() for p in d.split(";") if p.strip() and os.path.isdir(p.strip())]
+        if dirs:
+            return ";".join(dirs)
     if d and os.path.isdir(d):
         return d
     for p in paths:
@@ -55,6 +69,22 @@ def _resolve_models_dir(s, paths):
             return cand
     raise RuntimeError("Models folder not found: set it in the R5 Map Loader > Import panel "
                        "(for a Legion+ export, it is the '_models' folder next to the .mprt)")
+
+
+def _texture_libraries(s):
+    """Folders where textures are looked up by material name (materials exported without their textures)."""
+    out = []
+    d = bpy.path.abspath(s.models_dir) if s.models_dir else ""
+    for m in [x.strip() for x in d.split(";") if x.strip()]:
+        parent = os.path.dirname(m.rstrip("\\/"))
+        out += [m, os.path.join(parent, "_shared_textures"), os.path.join(parent, "_images")]
+    try:
+        from . import game_import
+        for m in game_import.all_cached_model_dirs(s):
+            out.append(os.path.join(os.path.dirname(m), "_shared_textures"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[R5] texture libraries: {exc}")
+    return out
 
 
 def _offset(scene, s, centroid_fn):
@@ -92,10 +122,13 @@ def import_map(context, paths, report=print):
     if context.object and context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
     castfile.clear_image_cache()
+    castfile.set_texture_libraries(_texture_libraries(s))
 
     world_paths = [p for p in paths if p.lower().endswith(".cast")]
     place_paths = [p for p in paths if os.path.splitext(p)[1].lower() in PLACEMENT_EXT]
-    if s.import_world:
+    if s.import_world and not world_paths:
+        # the .cast next to the .mprt, unless another geometry was given (R5Flowstate: a Legion+ export of the
+        # map replaces the collision terrain of the cache)
         for p in place_paths:
             if p.lower().endswith(".mprt"):
                 cand = os.path.splitext(p)[0] + ".cast"
@@ -127,6 +160,8 @@ def import_map(context, paths, report=print):
         if p.lower().endswith(".ent"):
             with open(p, "r", encoding="utf-8", errors="replace") as f:
                 take(placement.parse_ent_full(f.read()), os.path.basename(p))
+        elif p.lower().endswith(".nut"):
+            take(placement.parse_nut(p), os.path.basename(p))      # ReMap custom map script
         else:
             placements.extend(placement.load_placements(p))
     kinds = tuple(k.strip().lower() for k in s.ent_files.split(",") if k.strip())
@@ -212,8 +247,10 @@ def import_map(context, paths, report=print):
     n_poi = regions.add_zones(scene, zones, unit, offset) if zones else 0
     if sun:
         s.map_sun_json = json.dumps(sun)
-        from . import sky
+        from . import sky, properties as _props
         s.sky_sun_color = sky.default_sun_color(s)
+        if s.sky_use_map_sun:
+            _props.sync_sun_sliders(s)        # the sliders start from the map's sun direction
     regions.get_region(scene)
     regions.ensure_clip_modifiers(scene)
 
@@ -331,7 +368,7 @@ class R5_OT_import_map(bpy.types.Operator, ImportHelper):
     bl_options = {"REGISTER", "UNDO"}
 
     filename_ext = ".mprt"
-    filter_glob: StringProperty(default="*.mprt;*.cast;*.ent;*.vpk;*.json;*.csv", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.mprt;*.cast;*.ent;*.vpk;*.json;*.csv;*.nut", options={"HIDDEN"})
     files: CollectionProperty(type=bpy.types.OperatorFileListElement, options={"HIDDEN", "SKIP_SAVE"})
     directory: StringProperty(subtype="DIR_PATH", options={"HIDDEN"})
 
@@ -418,10 +455,24 @@ class R5_OT_make_real(bpy.types.Operator):
 
 
 def menu_import(self, context):
-    self.layout.operator(R5_OT_import_map.bl_idname, text="R5 Map Loader (.mprt/.cast/.ent/.vpk)")
+    self.layout.operator(R5_OT_import_map.bl_idname, text="R5 Map Loader (.mprt/.cast/.ent/.vpk/.nut)")
 
 
-CLASSES = (R5_OT_import_map, R5_OT_update_lods, R5_OT_show_all, R5_OT_make_real)
+class R5_OT_link_materials(bpy.types.Operator):
+    """Show the materials of the props in the Material tab: each instancer (one object for every copy of a model)
+    gets its model's materials. Editing them changes every copy of the model"""
+    bl_idname = "r5.link_materials"
+    bl_label = "Show prop materials"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        objs = [o for o in context.scene.objects if "apx_gn" in o and o.type == "MESH"]
+        n = sum(1 for o in objs if gn_instancer.link_model_materials(o) >= 0)
+        self.report({"INFO"}, f"{n} prop models: select one, then open the Material tab")
+        return {"FINISHED"}
+
+
+CLASSES = (R5_OT_import_map, R5_OT_update_lods, R5_OT_show_all, R5_OT_make_real, R5_OT_link_materials)
 
 
 def register():

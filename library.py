@@ -28,7 +28,15 @@ _LOD_OBJ_RE = re.compile(r"lod[_\-]?(\d+)", re.IGNORECASE)
 # Model folder index
 # --------------------------------------------------------------------------
 def build_index(root):
-    """Return {model_key: {lod: path}}. Extension preference = SUPPORTED_EXT order."""
+    """Return {model_key: {lod: path}}. Extension preference = SUPPORTED_EXT order.
+    `root` may list several folders separated by ";": the first folder holding a model wins."""
+    if ";" in root:
+        merged = {}
+        for r in (p.strip() for p in root.split(";")):
+            if r and os.path.isdir(r):
+                for k, v in build_index(r).items():
+                    merged.setdefault(k, v)
+        return merged
     index = {}
     prio = {e: i for i, e in enumerate(SUPPORTED_EXT)}
     for dirpath, _dirs, files in os.walk(root):

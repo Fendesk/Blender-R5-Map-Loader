@@ -4,6 +4,7 @@ from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProp
 
 from . import lod_system
 from .regions import R5_POI
+from .lights import R5_LightCat
 
 
 def _lod_changed(self, context):
@@ -29,6 +30,41 @@ def _sky_changed(self, context):
         print(f"[R5] sky: {exc}")
 
 
+_SUN_SYNC = [False]
+
+
+def sync_sun_sliders(s):
+    """Copy the map's sun direction into the elevation / rotation sliders (without leaving the map sun)."""
+    from . import sky
+    import math
+    got = sky._map_sun(s)
+    if not got:
+        return
+    _SUN_SYNC[0] = True
+    try:
+        s.sky_sun_elevation = max(-10.0, min(90.0, math.degrees(got[0])))
+        s.sky_sun_rotation = (math.degrees(got[1]) + 180.0) % 360.0 - 180.0
+    finally:
+        _SUN_SYNC[0] = False
+
+
+def _sun_angle_changed(self, context):
+    """Moving the sun by hand leaves the map's sun (otherwise the sliders would have no effect)."""
+    if not _SUN_SYNC[0] and self.sky_use_map_sun and self.map_sun_json:
+        _SUN_SYNC[0] = True
+        try:
+            self.sky_use_map_sun = False
+        finally:
+            _SUN_SYNC[0] = False
+    _sky_changed(self, context)
+
+
+def _use_map_sun_changed(self, context):
+    if self.sky_use_map_sun and not _SUN_SYNC[0]:
+        sync_sun_sliders(self)
+    _sky_changed(self, context)
+
+
 def _sky_rebuild(self, context):
     """Dome mapping change: the world nodes are rebuilt."""
     from . import sky
@@ -42,7 +78,50 @@ _TEX_LIMITS = [("OFF", "No limit", ""), ("4096", "4096", ""), ("2048", "2048", "
                ("512", "512", "")]
 
 
+def _game_maps(self, context):
+    from . import game_import
+    return game_import.map_enum_items(self, context)
+
+
 class R5_Settings(bpy.types.PropertyGroup):
+    # ---------------- Import from game ----------------
+    game_dir: StringProperty(name="Game folder", subtype="DIR_PATH",
+                             description="R5Reloaded / R5Flowstate folder (the one holding r5apex.exe, vpk and paks)")
+    game_map: EnumProperty(name="Map", items=_game_maps,
+                           description="Maps found in the game's vpk folder")
+    game_cache_dir: StringProperty(
+        name="Cache folder", subtype="DIR_PATH",
+        description="Where the extracted maps are kept (several GB per map). Empty = the add-on's user folder. "
+                    "No spaces in the path (revpk limitation), same drive as the game")
+    legion_path: StringProperty(name="Legion+", subtype="FILE_PATH",
+                                description="Another LegionPlus.exe to use instead of the one bundled with the add-on "
+                                            "(empty = bundled)")
+    revpk_path: StringProperty(name="revpk", subtype="FILE_PATH",
+                               description="Another revpk.exe to try first (empty = the one bundled with the add-on, "
+                                           "then the copies found on this computer)")
+    rsx_path: StringProperty(name="RSX", subtype="FILE_PATH",
+                             description="rsx_nogui.exe (RSX 2.x, command-line build). Needed for R5Flowstate maps: "
+                                         "their paks can only be read by RSX. Found by Detect in Documents / "
+                                         "Downloads / Desktop")
+    import_source: EnumProperty(
+        name="Source",
+        items=[("FILES", "From files", "Legion+ / RSX exports (.mprt, .cast), entity files (.ent, .vpk), ReMap "
+                                       "scripts (.nut), .json / .csv"),
+               ("GAME", "From the game (Beta)", "EXPERIMENTAL. Pick a map of an R5Reloaded / R5Flowstate install: "
+                                                "everything is extracted and cached automatically")],
+        default="FILES")
+    game_export_dir: StringProperty(
+        name="Legion+ export", subtype="DIR_PATH",
+        description="R5Flowstate maps: folder of a Legion+ export of the same map (<map>_LOD0.cast + _models). Its "
+                    "geometry and models are used; props, entities and the sun come from the game. Missing models "
+                    "are taken from the R5Reloaded maps already imported")
+    game_search_all: BoolProperty(
+        name="Search every map pak", default=False,
+        description="When models are still missing after the map's own paks, its map family and the common paks, "
+                    "also export every other map pak (slow: a few minutes per pak)")
+    game_rebuild: BoolProperty(name="Rebuild cache", default=False,
+                               description="Extract the map again even when a cache exists")
+
     # ---------------- Visibility ----------------
     hide_trigger: BoolProperty(name="Hide triggers", default=True, update=_vis_changed,
                                description="toolstrigger, fog volumes...")
@@ -284,9 +363,12 @@ class R5_Settings(bpy.types.PropertyGroup):
                                      items=[("2048", "2048", ""), ("4096", "4096", ""), ("8192", "8192", "")],
                                      default="4096")
     sky_sun_elevation: FloatProperty(name="Sun elevation (°)", default=35.0, min=-10.0, max=90.0,
-                                     update=_sky_changed)
+                                     update=_sun_angle_changed,
+                                     description="Height of the sun above the horizon. Changing it leaves the "
+                                                 "map's sun")
     sky_sun_rotation: FloatProperty(name="Sun rotation (°)", default=40.0, soft_min=-180, soft_max=180,
-                                    update=_sky_changed)
+                                    update=_sun_angle_changed,
+                                    description="Direction the sun comes from. Changing it leaves the map's sun")
     sky_sun_strength: FloatProperty(name="Sun strength", default=4.0, min=0.0, update=_sky_changed)
     sky_sun_color: FloatVectorProperty(
         name="Sun colour", subtype="COLOR", size=3, min=0.0, max=1.0, default=(1.0, 0.96, 0.9),
@@ -322,9 +404,11 @@ class R5_Settings(bpy.types.PropertyGroup):
                                     update=_sky_changed,
                                     description="EEVEE only computes volumes up to this distance")
     sky_add_sun: BoolProperty(name="Add a sun lamp", default=True, update=_sky_changed)
-    sky_use_map_sun: BoolProperty(name="Use the map's sun", default=True, update=_sky_changed,
+    sky_use_map_sun: BoolProperty(name="Use the map's sun", default=True, update=_use_map_sun_changed,
                                   description="Use light_environment from an .ent file when one was loaded")
     map_sun_json: StringProperty(default="", options={"HIDDEN"})
+    # City lights (lights.py): one entry per light type found in the map
+    light_cats: CollectionProperty(type=R5_LightCat)
 
     # ---------------- Regions / POI ----------------
     pois: CollectionProperty(type=R5_POI)
@@ -336,14 +420,17 @@ class R5_Settings(bpy.types.PropertyGroup):
 
 
 def register():
+    bpy.utils.register_class(R5_LightCat)
     bpy.utils.register_class(R5_Settings)
     bpy.types.Scene.r5_settings = bpy.props.PointerProperty(type=R5_Settings)
 
 
-CLASSES = (R5_Settings,)
+CLASSES = (R5_LightCat, R5_Settings)
 
 
 def unregister():
     if hasattr(bpy.types.Scene, "r5_settings"):
         del bpy.types.Scene.r5_settings
     bpy.utils.unregister_class(R5_Settings)
+    if getattr(R5_LightCat, "is_registered", False):
+        bpy.utils.unregister_class(R5_LightCat)

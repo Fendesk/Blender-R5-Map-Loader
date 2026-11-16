@@ -306,8 +306,41 @@ def create_instancer(key, lods, placements_xf, collection, scene):
     for i in range(MAX_LEVELS):
         mod[ids[f"LOD{i}"]] = lods[i] if i < len(lods) else None
     mod[ids["Levels"]] = min(len(lods), MAX_LEVELS)
+    link_model_materials(obj, lods)
     collection.objects.link(obj)
     return obj
+
+
+def link_model_materials(obj, lods=None):
+    """Give the instancer (a point cloud: one object for every copy of a model) the materials of its model, so
+    that selecting it shows them in the Material tab. They are the model's own materials: editing one changes
+    every copy. The points have no faces, so these slots do not change what is drawn."""
+    if lods is None:
+        mod = next((m for m in obj.modifiers if m.type == "NODES" and m.node_group
+                    and m.node_group.name.startswith(GROUP)), None)
+        if mod is None:
+            return 0
+        ids = _ids(mod.node_group)
+        lods = []
+        for i in range(MAX_LEVELS):
+            try:
+                lods.append(mod[ids[f"LOD{i}"]])
+            except (KeyError, TypeError):
+                lods.append(None)
+    if not lods or lods[0] is None:
+        return 0
+    me = obj.data
+    have = {m.name for m in me.materials if m}
+    n = 0
+    for o in lods[0].all_objects:
+        if o.type != "MESH":
+            continue
+        for m in o.data.materials:
+            if m is not None and m.name not in have:
+                me.materials.append(m)
+                have.add(m.name)
+                n += 1
+    return n
 
 
 def instancer_objects(scene):

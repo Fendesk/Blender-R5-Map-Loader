@@ -221,8 +221,107 @@ def parse_mprt(path):
     return out
 
 
+# --------------------------------------------------------------------------
+# ReMap / R5Reloaded custom maps (.nut Squirrel scripts)
+# --------------------------------------------------------------------------
+_NUT_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_NUT_ASSET_RE = re.compile(r'\$\s*"([^"]+\.rmdl)"', re.IGNORECASE)
+_NUT_VEC_RE = re.compile(r"<\s*(-?[\d.eE+\-]+)\s*,\s*(-?[\d.eE+\-]+)\s*,\s*(-?[\d.eE+\-]+)\s*>")
+# functions that only declare an asset or define the mover logic: not props
+_NUT_SKIP = {"PrecacheModel", "SetValueForModelKey", "function", "if", "while", "for"}
+
+
+def _nut_calls(text):
+    """Yield (function name, argument text) for every call, with nested parentheses handled."""
+    i, n = 0, len(text)
+    while True:
+        m = _NUT_CALL_RE.search(text, i)
+        if not m:
+            return
+        depth, j = 1, m.end()
+        in_str = False
+        while j < n and depth:
+            c = text[j]
+            if in_str:
+                if c == '"' and text[j - 1] != "\\":
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            j += 1
+        yield m.group(1), text[m.end(): j - 1]
+        i = m.end()
+
+
+def _split_args(s):
+    out, depth, cur, in_str = [], 0, [], False
+    for c in s:
+        if in_str:
+            cur.append(c)
+            if c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c in "(<[":
+            depth += 1
+        elif c in ")>]":
+            depth -= 1
+        elif c == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(c)
+    if cur:
+        out.append("".join(cur).strip())
+    return out
+
+
+def parse_nut_text(text):
+    """ReMap / map-editor scripts: every call whose first argument is an $"mdl/...rmdl" asset followed by two
+    vectors is a prop (MapEditor_CreateProp, MapEditor_CreateMovingProp, CreateEditorProp...); calls with
+    "Zipline" in their name give zipline cables. Comments are ignored."""
+    text = re.sub(r"//[^\n]*", "", text)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    data = EntData()
+    for fn, args in _nut_calls(text):
+        if fn in _NUT_SKIP:
+            continue
+        parts = _split_args(args)
+        if not parts:
+            continue
+        asset = _NUT_ASSET_RE.fullmatch(parts[0].strip())
+        vecs = [_NUT_VEC_RE.fullmatch(p.strip()) for p in parts]
+        if asset and len(parts) >= 3 and vecs[1] and vecs[2]:
+            scale = 1.0
+            if fn.endswith("CreateProp") and len(parts) >= 7:
+                scale = _float(parts[6], 1.0)        # (asset, origin, angles, mantle, fade, realm, scale)
+            data.placements.append(Placement(
+                model=asset.group(1),
+                origin=tuple(float(v) for v in vecs[1].groups()),
+                angles=tuple(float(v) for v in vecs[2].groups()),
+                scale=scale if scale > 0 else 1.0, classname=fn))
+        elif "zipline" in fn.lower():
+            pts = [tuple(float(v) for v in m.groups()) for m in vecs if m]
+            if len(pts) >= 4:                         # (start, start angles, end, end angles, ...)
+                data.ziplines.append([pts[0], pts[2]])
+            elif len(pts) >= 2:
+                data.ziplines.append([pts[0], pts[1]])
+    return data
+
+
+def parse_nut(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return parse_nut_text(f.read())
+
+
 def load_placements(path):
     ext = os.path.splitext(path)[1].lower()
+    if ext == ".nut":
+        return parse_nut(path).placements
     if ext == ".mprt":
         return parse_mprt(path)
     if ext == ".json":

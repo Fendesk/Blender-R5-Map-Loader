@@ -75,6 +75,8 @@ FX_MODEL_RE = re.compile(r"godray|god_ray|(^|_)atmosphere(_|$)|lightshaft|light_
 _OVERLAY_RE = re.compile(r"_b2t($|_)|_bt($|_)|transparent|decal|(^|_)dcl|overlay|stencil|grime|graffiti|puddle|"
                          r"stain|drip|splatter|(^|_)cracks?($|_)|(^|_)burn_|sticker|_ovl($|_)")
 _VCTINT_RE = re.compile(r"_vc($|_)|vert_?colou?r|_vcolor|_vt($|_)")
+_FOLIAGE_RE = re.compile(r"leaf|leaves|foliage|grass|fern|bush|shrub|plant|tree|branch|ivy|vine|moss_clump|flower|"
+                         r"weed|bark|needle|pine|palm")
 _CUTOUT_RE = re.compile(r"(?:^|[_\-\s\d])(?:leaf|leaves|foliage|grass|fern|bush|shrub|plant|tree|branch|ivy|vine|"
                         r"moss_clump|flower|weed|fence|chainlink|chain_link|grate|grating|net|alpha|cutout|hair|"
                         r"fx|glass)")
@@ -84,7 +86,7 @@ _BM_RE = re.compile(r"_bm($|_)")
 # ... which are still real overlays when their name says so
 _BM_OVERLAY_RE = re.compile(r"transparent|decal|_b2t($|_)|_bt($|_)")
 
-MAT_VERSION = 10
+MAT_VERSION = 12
 
 
 def material_group(name):
@@ -403,6 +405,67 @@ _img_missing = set()
 def clear_image_cache():
     _img_cache.clear()
     _img_missing.clear()
+    _light_cache.clear()
+
+
+# Texture libraries: folders searched by MATERIAL NAME when a material has no texture file of its own
+# (RSX model exports without textures, R5Flowstate collision materials...): "<material>_<slot>Texture.png"
+# files of the game caches (_shared_textures) and of Legion+ exports (_models/*/_images).
+_tex_libs = []
+_tex_index = {"idx": None}
+_TEX_EXT = (".png", ".dds", ".tga")
+
+
+def set_texture_libraries(dirs):
+    seen, libs = set(), []
+    for d in dirs:
+        if d and os.path.isdir(d) and os.path.normcase(d) not in seen:
+            seen.add(os.path.normcase(d))
+            libs.append(d)
+    if libs != _tex_libs:
+        _tex_libs[:] = libs
+        _tex_index["idx"] = None
+
+
+def material_textures(name):
+    """{"albedoTexture": path, ...} found for this material name in the texture libraries."""
+    if not _tex_libs or not name:
+        return {}
+    idx = _tex_index["idx"]
+    if idx is None:
+        idx = {}
+        for d in _tex_libs:
+            for root, _dirs, files in os.walk(d):
+                for f in files:
+                    low = f.lower()
+                    if not low.endswith(_TEX_EXT):
+                        continue
+                    stem = os.path.splitext(f)[0]
+                    cut = stem.rfind("_")
+                    if cut <= 0 or not stem[cut + 1:].lower().endswith("texture"):
+                        continue
+                    idx.setdefault(stem[:cut].lower(), {}).setdefault(stem[cut + 1:], os.path.join(root, f))
+        _tex_index["idx"] = idx
+    return idx.get(name.lower(), {})
+
+
+def _fill_from_library(cast, cm, name):
+    """When none of the material's own textures exists, take the textures of the same material name from the
+    texture libraries."""
+    if cm is None or not _tex_libs:
+        return
+    for h2 in cm.slots.values():
+        p = cast.texture_path(h2)
+        if p and os.path.isfile(p):
+            return
+    lib = material_textures(name)
+    if not lib:
+        return
+    cm.slots = {}
+    for slot, path in lib.items():
+        key = "lib:" + path
+        cast.files[key] = path
+        cm.slots[slot] = key
 
 
 def _exists(path, tries=3):
@@ -461,6 +524,40 @@ def _image(path, non_color):
 # --------------------------------------------------------------------------
 # Materials
 # --------------------------------------------------------------------------
+_light_cache = {}
+
+
+def _light_albedo(img):
+    """True for a near-uniform white / light grey colour map (a texture meant to be tinted)."""
+    if img is None:
+        return False
+    key = img.get("apx_key") or img.name
+    v = _light_cache.get(key)
+    if v is not None:
+        return v
+    v = False
+    small = None
+    try:
+        w, h = img.size
+        if w and h:
+            small = img.copy()
+            small.scale(16, 16)
+            px = np.empty(16 * 16 * 4, np.float32)
+            small.pixels.foreach_get(px)
+            rgb = px.reshape(-1, 4)[:, :3]
+            v = bool(rgb.mean() > 0.78 and (rgb.max(1) - rgb.min(1)).mean() < 0.06 and rgb.std() < 0.08)
+    except (RuntimeError, ValueError, AttributeError):
+        v = False
+    finally:
+        if small is not None:
+            try:
+                bpy.data.images.remove(small)
+            except (RuntimeError, ReferenceError):
+                pass
+    _light_cache[key] = v
+    return v
+
+
 def _sock(sockets, identifier):
     """The Mix node has several sockets named "A"/"B"/"Result" (float, vector, color):
     pick by identifier, otherwise the link goes to a disabled socket and is ignored."""
@@ -562,9 +659,9 @@ def get_material(cast, h, settings):
     x = -1100
     y = 400
 
+    _fill_from_library(cast, cm, name)
     if is_ice_material(name) and _build_ice(mat, nt, bsdf, cast, cm, settings):
         return mat
-
     # Role of each texture: file names first, then the (positional) slot names
     roles, unnamed = texture_roles(cast, cm, name)
     overlay = is_overlay(name)
@@ -591,13 +688,6 @@ def get_material(cast, h, settings):
         y -= 300
         return n, cast.texture_path(h2)
 
-    vctint = is_vctint(name)
-    col_attr = None
-    if overlay or vctint:
-        col_attr = nt.nodes.new("ShaderNodeVertexColor")
-        col_attr.layer_name = "Col"
-        col_attr.location = (x, y + 300)
-
     alb, alb_path = tex("albedo", False)
     if alb is not None:
         nt.nodes.active = alb       # Solid > Texture shading shows the active image node
@@ -606,6 +696,19 @@ def get_material(cast, h, settings):
     # Blend materials (walls, ground): the last exported slot is not always the specular of layer 1
     # (bright masks -> white chrome); they are never metals anyway.
     blend = "albedo2" in roles or is_blend_material(name)
+    # Vertex colour tint: the game multiplies the albedo by the model's vertex colour. It is how one grey
+    # material gives a blue container, a red crate or a yellow pipe (slums_plastic_container_01,
+    # crate_plastic_medium_01, imc_painted_metal_01...), not only the "_vc" materials. Meshes without vertex
+    # colours get a white attribute (no change). Blend materials use them as a blend mask: not tinted.
+    # Foliage keeps wind / ambient-occlusion data in its vertex colours: not tinted either.
+    vctint = is_vctint(name) or (alb is not None and not blend and group not in ("fx", "particle", "tool", "trigger")
+                                 and not _FOLIAGE_RE.search(name.lower()))
+    mat["r5_vctint"] = bool(vctint)
+    col_attr = None
+    if overlay or vctint:
+        col_attr = nt.nodes.new("ShaderNodeVertexColor")
+        col_attr.layer_name = "Col"
+        col_attr.location = (x, y + 300)
     spec = None if blend else tex("specular", False)[0]
     base_out = alb.outputs["Color"] if alb else None
     if base_out is not None and vctint and col_attr is not None:
@@ -869,7 +972,12 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
         if si is None:
             si = slot_of[m.mat] = len(slots)
             slots.append(m.mat)
-            if is_overlay(mname) or is_vctint(mname):
+            mat = mat_cache.get(m.mat)
+            if mat is None:
+                mat = mat_cache[m.mat] = get_material(cast, m.mat, settings)
+            # the material decides whether it reads the vertex colours (tint / decal alpha): then every
+            # mesh using it needs the attribute, white when the mesh has none (a missing attribute is black)
+            if is_overlay(mname) or is_vctint(mname) or (mat is not None and mat.get("r5_vctint")):
                 need_col = True
         has_n = m.nrm is not None and len(m.nrm) == nv
         pos = m.pos
@@ -961,10 +1069,7 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
         me.polygons.foreach_set("use_smooth", np.ones(nt, dtype=bool))
 
     for h in slots:
-        mat = mat_cache.get(h)
-        if mat is None:
-            mat = mat_cache[h] = get_material(cast, h, settings)
-        me.materials.append(mat)
+        me.materials.append(mat_cache[h])
     return me
 
 

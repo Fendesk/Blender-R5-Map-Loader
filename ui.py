@@ -10,49 +10,117 @@ class _Base:
 
 
 class R5_PT_import(_Base, bpy.types.Panel):
+    """Import: from the game (R5Reloaded / R5Flowstate install) or from exported files, in one panel."""
     bl_label = "Import"
     bl_idname = "R5_PT_import"
+    bl_order = 0
 
     def draw(self, context):
         s = context.scene.r5_settings
         col = self.layout.column()
-        col.prop(s, "models_dir", text="Models")
-        col.operator("r5.import_map", icon="IMPORT")
+        if not hasattr(s, "import_source"):
+            # settings class of the previous version still loaded (update installed without restarting)
+            col.label(text="Restart Blender to finish the update", icon="ERROR")
+            return
+        col.row().prop(s, "import_source", expand=True)
+        if s.import_source == "GAME":
+            from . import game_import
+            box = col.box()
+            box.label(text="Experimental feature (beta)", icon="EXPERIMENTAL")
+            box.label(text="Results may be incomplete: missing models,")
+            box.label(text="textures, or approximate terrain (R5Flowstate).")
+            game_import.draw_game(col, s)
+        else:
+            col.prop(s, "models_dir", text="Models")
+            row = col.row()
+            row.scale_y = 1.3
+            row.operator("r5.import_map", text="Import files (.mprt .ent .vpk .nut .cast...)", icon="IMPORT")
         col.prop(s, "instancing_mode", text="")
-        box = col.box()
-        box.label(text="Entities (dynamic props, POIs)", icon="OUTLINER_OB_EMPTY")
-        box.prop(s, "ent_path", text="")
-        box.prop(s, "ent_files")
-        box.prop(s, "import_ziplines")
-        box.label(text="R5Reloaded: vpk/englishserver_<map>.bsp.pak000_dir.vpk")
-        box = col.box()
-        box.label(text="Map geometry (.cast)", icon="WORLD")
-        box.prop(s, "import_world")
-        box.prop(s, "world_split")
+
+
+class _ImportSub(_Base):
+    bl_parent_id = "R5_PT_import"
+    bl_options = {"DEFAULT_CLOSED"}
+
+
+class R5_PT_import_tools(_ImportSub, bpy.types.Panel):
+    bl_label = "Tools & cache"
+    bl_idname = "R5_PT_import_tools"
+
+    @classmethod
+    def poll(cls, context):
+        s = context.scene.r5_settings
+        return getattr(s, "import_source", "GAME") == "GAME"
+
+    def draw(self, context):
+        from . import game_import
+        game_import.draw_game_tools(self.layout.column(), context.scene.r5_settings)
+
+
+class R5_PT_import_ents(_ImportSub, bpy.types.Panel):
+    bl_label = "Entities (dynamic props, POIs)"
+    bl_idname = "R5_PT_import_ents"
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context.scene.r5_settings, "import_source", "FILES") == "FILES"
+
+    def draw(self, context):
+        s = context.scene.r5_settings
+        col = self.layout.column()
+        col.prop(s, "ent_path", text="")
+        col.prop(s, "ent_files")
+        col.label(text="R5Reloaded: vpk/englishserver_<map>.bsp.pak000_dir.vpk")
+
+
+class R5_PT_import_geometry(_ImportSub, bpy.types.Panel):
+    bl_label = "Map geometry & ziplines"
+    bl_idname = "R5_PT_import_geometry"
+
+    def draw(self, context):
+        s = context.scene.r5_settings
+        col = self.layout.column()
+        col.prop(s, "import_world")
+        col.prop(s, "world_split")
         if s.world_split == "TILES":
-            box.prop(s, "world_tile_size")
-        box = col.box()
-        box.label(text=".cast files", icon="TEXTURE")
-        box.prop(s, "cast_load_textures")
+            col.prop(s, "world_tile_size")
+        col.prop(s, "import_ziplines")
+
+
+class R5_PT_import_cast(_ImportSub, bpy.types.Panel):
+    bl_label = "Materials & meshes (.cast)"
+    bl_idname = "R5_PT_import_cast"
+
+    def draw(self, context):
+        s = context.scene.r5_settings
+        col = self.layout.column()
+        col.prop(s, "cast_load_textures")
         if s.cast_load_textures:
-            box.prop(s, "cast_alpha_mode")
-            box.prop(s, "cast_spec_to_metal")
-            box.prop(s, "cast_flip_normal_green")
-            box.prop(s, "cast_extra_textures")
-        box.prop(s, "decal_offset")
-        box.prop(s, "cast_weld")
-        box.prop(s, "cast_custom_normals")
-        box = col.box()
-        box.label(text="Options", icon="PREFERENCES")
-        box.prop(s, "unit_scale")
-        box.prop(s, "axis_correction", text="Axis")
-        box.prop(s, "recenter")
-        box.prop(s, "split_by_category")
-        box.prop(s, "exclude_patterns")
-        box.prop(s, "use_region")
+            col.prop(s, "cast_alpha_mode")
+            col.prop(s, "cast_spec_to_metal")
+            col.prop(s, "cast_flip_normal_green")
+            col.prop(s, "cast_extra_textures")
+        col.prop(s, "decal_offset")
+        col.prop(s, "cast_weld")
+        col.prop(s, "cast_custom_normals")
+
+
+class R5_PT_import_options(_ImportSub, bpy.types.Panel):
+    bl_label = "Options"
+    bl_idname = "R5_PT_import_options"
+
+    def draw(self, context):
+        s = context.scene.r5_settings
+        col = self.layout.column()
+        col.prop(s, "unit_scale")
+        col.prop(s, "axis_correction", text="Axis")
+        col.prop(s, "recenter")
+        col.prop(s, "split_by_category")
+        col.prop(s, "exclude_patterns")
+        col.prop(s, "use_region")
         if s.use_region:
-            box.prop(s, "region_center")
-            box.prop(s, "region_radius")
+            col.prop(s, "region_center")
+            col.prop(s, "region_radius")
 
 
 class R5_PT_visibility(_Base, bpy.types.Panel):
@@ -92,6 +160,9 @@ class R5_PT_models(_Base, bpy.types.Panel):
         op.hide = False
         col.template_list("R5_UL_models", "", bpy.data, "objects", s, "model_index", rows=8)
         col.label(text="Count = placements. Eye = viewport, camera = render", icon="INFO")
+        col.operator("r5.link_materials", icon="MATERIAL")
+        col.label(text="Clicking a prop selects every copy of its model", icon="INFO")
+        col.label(text="(one instancer object): its Material tab edits them all")
 
 
 class R5_PT_regions(_Base, bpy.types.Panel):
@@ -221,9 +292,9 @@ class R5_PT_sky(_Base, bpy.types.Panel):
         if s.sky_add_sun or s.sky_mode == "PROCEDURAL":
             if s.map_sun_json:
                 box.prop(s, "sky_use_map_sun")
-            if not (s.map_sun_json and s.sky_use_map_sun):
-                box.prop(s, "sky_sun_elevation")
-                box.prop(s, "sky_sun_rotation")
+            # always editable: moving them switches to a manual sun (they start from the map's sun)
+            box.prop(s, "sky_sun_elevation")
+            box.prop(s, "sky_sun_rotation")
             box.prop(s, "sky_sun_strength")
             row = box.row(align=True)
             row.prop(s, "sky_sun_color", text="Colour")
@@ -307,7 +378,8 @@ class R5_PT_optimize(_Base, bpy.types.Panel):
         box.label(text=f"LOD0 triangles (unique): {tris:,}")
 
 
-CLASSES = (R5_PT_import, R5_PT_visibility, R5_PT_models, R5_PT_regions, R5_PT_lod, R5_PT_lod_import,
+CLASSES = (R5_PT_import, R5_PT_import_tools, R5_PT_import_ents, R5_PT_import_geometry, R5_PT_import_cast,
+           R5_PT_import_options, R5_PT_visibility, R5_PT_models, R5_PT_regions, R5_PT_lod, R5_PT_lod_import,
            R5_PT_sky, R5_PT_render, R5_PT_optimize)
 
 
