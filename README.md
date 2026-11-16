@@ -14,67 +14,6 @@ The old *Apex Legends Map Importer* (`apex_map_importer`) can stay installed: si
 share operator / panel / property names, so each one can be disabled or uninstalled on its own.
 The panels live in the 3D View > Sidebar (N) > **R5 Map Loader** tab. The importer is also in File > Import.
 
------------------------------------------------------------------------------
-# PAST PATCHNOTES
-
-## What's new in 0.12.0
-- **City lights**:
-  - **light type per prop type**: point, spot (cone, with angle and blend) or area (soft panel, with shape and
-    spread). Changes apply live to the lights already created.
-  - **Light quality improvement**: fix some weird lights that clip in the geometry.
-
-## What's new in 0.11.0
-- **Import panel**: *From files* comes first; *From the game* is marked **Beta** (experimental: models,
-  textures or terrain may be incomplete).
-- **City lights** (new panel): *Find light sources* sorts the props into types (street lamps, floodlights,
-  signs & screens, interior & wall lights, other glowing props); *Create lights* puts a point light at the glowing
-  part of each one. Per type, live: on/off, power, colour (or each model's emissive colour), radius, shadows,
-  **glow of the emissive textures**, max number of lights (closest to the 3D cursor first).
-- **Prop materials in the Material tab**: clicking a prop selects the object that draws every copy of its model;
-  it now carries the model's materials, so the Material tab shows them (editing one changes every copy).
-  *Visibility > Prop models > Show prop materials* does it for maps imported with an older version.
-
-## What's new in 0.10.0
-- **One Import panel**: *From the game* / *From files* switch at the top; every option of the two former panels
-  is still there, in the sub-panels (*Tools & cache*, *Entities*, *Map geometry & ziplines*, *Materials & meshes*,
-  *Options*).
-- **R5Flowstate maps from the game**:
-  - **terrain and buildings rebuilt from the collision data** of the server BSP (the only geometry Flowstate ships:
-    the add-on decodes the collision BVH, ~2.7 million triangles on World's Edge). No UVs exist in that data:
-    textures are box-mapped (512 units per tile); a Legion+ export of the map, when given, replaces it with the
-    real render geometry.
-  - **the map's own props** (432k static props on World's Edge) with their **models exported by RSX**
-    (`rsx_nogui.exe`, your copy: *Tools & cache > RSX*, found by 🔍). RSX is the only tool reading the Flowstate
-    paks. Its textures cannot be exported from the command line (it crashes on the Flowstate paks): textures are
-    found **by material name** in the R5Reloaded caches and in Legion+ exports.
-- **White props fixed**: materials with a plain white / light grey albedo (painted metal, tarps, velvet...) are
-  tinted by the model's vertex colours, as in game (`silver_metal_panel_01`, `building_walls_metal_03`...).
-- **Sky**: the sun elevation / rotation sliders are always shown. They start from the map's sun; moving them
-  switches to a manual sun.
-- Textures missing from an export are looked up by material name in the other exports / caches.
-
-## What's new in 0.9.0
-- **More complete maps from the game**: models and materials are looked for in the map's patch paks
-  (`map(01).rpak`…), the paks of the same map family (a season map such as `mp_rr_canyonlands_mu1` reuses the
-  base `mp_rr_canyonlands_64k_x_64k`) and the common paks. Kings Canyon's terrain sections are props: they were
-  missing, leaving holes in the ground. The models of the dynamic props (`_script.ent`) are looked for as well.
-- **Missing textures**: textures a model uses but stores in another pak are taken from the other cached maps, then
-  exported from the common paks.
-- Option *Search every map pak* (slow) for what is still missing.
-- **ReMap custom maps (`.nut`)**: see *ReMap maps*.
-- **Find missing models in the game**: looks for the models of the last import that were not found, in every pak.
-
-## What's new in 0.8.0
-- Legion+ and revpk are **bundled**: importing from the game needs nothing else than the game.
-- revpk now works from any folder (it splits its own path on spaces: the add-on runs a copy from a folder without
-  spaces). An R5Reloaded install alone is enough.
-- 0.7.1: installing over a loaded version no longer mixes old and new code (error "no attribute 'game_dir'").
-
-## What's new in 0.7.0
-- **Import from game** panel: pick an R5Reloaded map in a list and import it, no manual export. See below.
------------------------------------------------------------------------------
-
-
 ## Import from game
 Panel **Import**, *From the game (Beta)* (top of the R5 Map Loader tab):
 1. Press 🔍 (*Detect game & tools*): finds the R5Reloaded / R5Flowstate installs (and RSX).
