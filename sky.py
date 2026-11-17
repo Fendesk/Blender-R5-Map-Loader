@@ -132,17 +132,20 @@ def _world(scene):
 
 def _set_nishita(node, s, sun_disc):
     elev, azim = sun_angles(s)
-    try:
-        node.sky_type = "NISHITA"
-        node.sun_elevation = elev
-        node.sun_rotation = azim
-        node.altitude = 500.0
-        node.air_density = s.sky_air_density
-        node.dust_density = s.sky_dust_density
-        node.ozone_density = s.sky_ozone_density
-        node.sun_disc = sun_disc
-    except (AttributeError, TypeError):
-        pass
+    # Blender 5.0+ renamed NISHITA to SINGLE_SCATTERING (same model, keeps the brightness calibration
+    # of _NISHITA_BASE) and dust_density to aerosol_density.
+    types = {e.identifier for e in node.bl_rna.properties["sky_type"].enum_items}
+    sky_type = "NISHITA" if "NISHITA" in types else "SINGLE_SCATTERING"
+    values = (("sky_type", sky_type), ("sun_elevation", elev), ("sun_rotation", azim), ("altitude", 500.0),
+              ("air_density", s.sky_air_density), ("dust_density", s.sky_dust_density),
+              ("aerosol_density", s.sky_dust_density), ("ozone_density", s.sky_ozone_density),
+              ("sun_disc", sun_disc))
+    for attr, val in values:
+        if hasattr(node, attr):
+            try:
+                setattr(node, attr, val)
+            except (AttributeError, TypeError, ValueError):
+                pass
 
 
 def _mix_rgba(nt, factor, a, b, loc, name=""):

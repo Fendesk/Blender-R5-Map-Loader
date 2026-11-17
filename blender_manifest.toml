@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "r5_map_loader"
-version = "0.12.0"
+version = "0.13.1"
 name = "Blender R5 Map Loader"
 tagline = "Loads R5Reloaded maps with dynamic LODs, regions and Cycles"
 maintainer = "Fendesk"
@@ -9,8 +9,6 @@ type = "add-on"
 blender_version_min = "4.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 tags = ["Import-Export"]
-# bundles LegionPlus.exe and revpk.exe (see tools/README.txt)
-platforms = ["windows-x64"]
 
 [permissions]
-files = "Reads map exports and game files, writes an extraction cache"
+files = "Reads map exports"

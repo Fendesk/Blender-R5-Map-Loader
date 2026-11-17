@@ -166,13 +166,9 @@ def rebuild(scene):
 
 
 def _region_mask(scene, pos):
-    """True for points outside the active region."""
-    from .regions import REGION
-    r = bpy.data.objects.get(REGION)
-    if r is None or r.scale.z <= 0.5:
-        return np.zeros(len(pos), dtype=bool)
-    d = np.linalg.norm(pos[:, :2] - np.array(r.location[:2], dtype=np.float32), axis=1)
-    return d > r.scale.x
+    """True for points outside the active region (every shown POI disc)."""
+    from .regions import outside_mask
+    return outside_mask(pos)
 
 
 def _compute_levels(scene, view, s):

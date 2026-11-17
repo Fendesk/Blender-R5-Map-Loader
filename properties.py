@@ -78,49 +78,8 @@ _TEX_LIMITS = [("OFF", "No limit", ""), ("4096", "4096", ""), ("2048", "2048", "
                ("512", "512", "")]
 
 
-def _game_maps(self, context):
-    from . import game_import
-    return game_import.map_enum_items(self, context)
-
-
 class R5_Settings(bpy.types.PropertyGroup):
-    # ---------------- Import from game ----------------
-    game_dir: StringProperty(name="Game folder", subtype="DIR_PATH",
-                             description="R5Reloaded / R5Flowstate folder (the one holding r5apex.exe, vpk and paks)")
-    game_map: EnumProperty(name="Map", items=_game_maps,
-                           description="Maps found in the game's vpk folder")
-    game_cache_dir: StringProperty(
-        name="Cache folder", subtype="DIR_PATH",
-        description="Where the extracted maps are kept (several GB per map). Empty = the add-on's user folder. "
-                    "No spaces in the path (revpk limitation), same drive as the game")
-    legion_path: StringProperty(name="Legion+", subtype="FILE_PATH",
-                                description="Another LegionPlus.exe to use instead of the one bundled with the add-on "
-                                            "(empty = bundled)")
-    revpk_path: StringProperty(name="revpk", subtype="FILE_PATH",
-                               description="Another revpk.exe to try first (empty = the one bundled with the add-on, "
-                                           "then the copies found on this computer)")
-    rsx_path: StringProperty(name="RSX", subtype="FILE_PATH",
-                             description="rsx_nogui.exe (RSX 2.x, command-line build). Needed for R5Flowstate maps: "
-                                         "their paks can only be read by RSX. Found by Detect in Documents / "
-                                         "Downloads / Desktop")
-    import_source: EnumProperty(
-        name="Source",
-        items=[("FILES", "From files", "Legion+ / RSX exports (.mprt, .cast), entity files (.ent, .vpk), ReMap "
-                                       "scripts (.nut), .json / .csv"),
-               ("GAME", "From the game (Beta)", "EXPERIMENTAL. Pick a map of an R5Reloaded / R5Flowstate install: "
-                                                "everything is extracted and cached automatically")],
-        default="FILES")
-    game_export_dir: StringProperty(
-        name="Legion+ export", subtype="DIR_PATH",
-        description="R5Flowstate maps: folder of a Legion+ export of the same map (<map>_LOD0.cast + _models). Its "
-                    "geometry and models are used; props, entities and the sun come from the game. Missing models "
-                    "are taken from the R5Reloaded maps already imported")
-    game_search_all: BoolProperty(
-        name="Search every map pak", default=False,
-        description="When models are still missing after the map's own paks, its map family and the common paks, "
-                    "also export every other map pak (slow: a few minutes per pak)")
-    game_rebuild: BoolProperty(name="Rebuild cache", default=False,
-                               description="Extract the map again even when a cache exists")
+    # (0.13: the "Import from the game" mode was removed; maps are imported from exports only)
 
     # ---------------- Visibility ----------------
     hide_trigger: BoolProperty(name="Hide triggers", default=True, update=_vis_changed,
@@ -204,6 +163,10 @@ class R5_Settings(bpy.types.PropertyGroup):
         name="VPK .ent files", default="script",
         description="Which ones to read in the VPK, comma separated: script, snd, spawn, env, fx "
                     "(env and fx are compressed in R5Reloaded VPKs and cannot be read)")
+    auto_entities: BoolProperty(
+        name="Export's entities", default=True,
+        description="With an .mprt and an empty Entities field: also load entities/<map>_script.ent next to it "
+                    "(RSXreloaded exports): doors, loot bins, evac towers, ziplines, POIs")
     import_ziplines: BoolProperty(name="Create ziplines", default=True,
                                   description="Create the zipline cables as curves from the .ent files")
     setup_viewport_on_import: BoolProperty(

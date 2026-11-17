@@ -46,15 +46,13 @@ def _get_child_collection(parent, name):
 
 def _resolve_models_dir(s, paths):
     if any(p.lower().endswith(".nut") for p in paths):
-        # ReMap maps use props of any map: the chosen models folder(s) + every map cached by Import from game
-        from . import game_import
+        # ReMap maps use props of any map: the chosen models folder(s), separated by ";"
         d = bpy.path.abspath(s.models_dir) if s.models_dir else ""
         dirs = [x.strip() for x in d.split(";") if x.strip() and os.path.isdir(x.strip())]
-        dirs += [x for x in game_import.all_cached_model_dirs(s) if x not in dirs]
         if dirs:
             return ";".join(dirs)
-        raise RuntimeError("No models for this .nut map: import a map with 'Import from game' first (its models "
-                           "are reused), or set the Models folder")
+        raise RuntimeError("No models for this .nut map: set the Models folder to the '_models' folder of a map "
+                           "export (several folders can be separated by ';')")
     d = bpy.path.abspath(s.models_dir) if s.models_dir else ""
     if d and ";" in d:          # several folders (game import: export + fallback caches)
         dirs = [p.strip() for p in d.split(";") if p.strip() and os.path.isdir(p.strip())]
@@ -78,12 +76,6 @@ def _texture_libraries(s):
     for m in [x.strip() for x in d.split(";") if x.strip()]:
         parent = os.path.dirname(m.rstrip("\\/"))
         out += [m, os.path.join(parent, "_shared_textures"), os.path.join(parent, "_images")]
-    try:
-        from . import game_import
-        for m in game_import.all_cached_model_dirs(s):
-            out.append(os.path.join(os.path.dirname(m), "_shared_textures"))
-    except Exception as exc:  # noqa: BLE001
-        print(f"[R5] texture libraries: {exc}")
     return out
 
 
@@ -144,6 +136,13 @@ def import_map(context, paths, report=print):
                 vpk_paths.append(extra)
         elif extra not in place_paths:
             place_paths.append(extra)
+    elif not extra and s.auto_entities:
+        # RSXreloaded export: <map>_LOD0.mprt + entities/<map>_script.ent (doors, loot bins, evac towers...)
+        for p in list(place_paths):
+            if p.lower().endswith(".mprt"):
+                ent = os.path.join(os.path.dirname(p), "entities", f"{_map_name(p)}_script.ent")
+                if os.path.isfile(ent) and ent not in place_paths:
+                    place_paths.append(ent)
 
     # 1) Placements --------------------------------------------------------
     placements, ziplines, zones, sun = [], [], [], {}
@@ -175,6 +174,9 @@ def import_map(context, paths, report=print):
             report(f"{os.path.basename(sk)} skipped (compressed in the VPK)")
     if not place_paths and ent_names:
         place_paths = [os.path.join(os.path.dirname(vpk_paths[0]), ent_names[0])]
+    # editor helpers of the entity files (editor_ref, editor_traverse, mp_titan_spawn...): invisible in game
+    placements = [p for p in placements
+                  if p.classname == "prop_static" or not p.model.replace("\\", "/").lower().startswith("mdl/dev/")]
     total_raw = len(placements)
     excl_re = exclude_regex(s.exclude_patterns)
     if excl_re is not None:
@@ -260,6 +262,8 @@ def import_map(context, paths, report=print):
             lim = optimize.apply_texture_limit(s.texture_limit)
             report(f"Viewport texture limit: {lim.replace('CLAMP_', '').replace('OFF', 'none')}")
 
+    if placements and created:
+        _frame_views(context, placements, unit, offset)
     visibility.apply(scene)
     context.view_layer.update()
     lod_system.apply_all(scene)
@@ -275,6 +279,53 @@ def import_map(context, paths, report=print):
     return created, len(available), missing
 
 
+def _frame_views(context, placements, unit, offset):
+    """Point the 3D views at the imported props when they are not looking at them. ReMap maps (.nut) are
+    often built far from the origin (1 km up in the sky): the view stayed on an empty grid, and as the
+    off-screen props are not instanced, View All could not find them either."""
+    wm = context.window_manager
+    if bpy.app.background or not wm.windows:
+        return
+    a = np.array([p.origin for p in placements], dtype=np.float64) * unit - np.array(offset[:])
+    lo, hi = np.percentile(a, 2, axis=0), np.percentile(a, 98, axis=0)
+    center = (lo + hi) / 2
+    size = float(np.linalg.norm(hi - lo))
+    margin = max(size * 0.1, 20.0)
+    for win in wm.windows:
+        for area in win.screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            sp = area.spaces.active
+            r3d = sp.region_3d
+            v = np.array(r3d.view_location[:])
+            if np.all(v >= lo - margin) and np.all(v <= hi + margin):
+                continue            # already looking inside the imported area
+            r3d.view_location = Vector(center)
+            r3d.view_distance = min(max(size * 0.6, 30.0), 4000.0)
+            if sp.clip_end < r3d.view_distance * 4:
+                sp.clip_end = r3d.view_distance * 4
+            area.tag_redraw()
+
+
+ZIPLINE_YELLOW =(1.0, 0.62, 0.02, 1.0)      # linear; the yellow cables of the game (sRGB ~ #FFCF1A)
+
+
+def zipline_material():
+    """Yellow cable material (Solid colour and Principled BSDF), also fixes older grey ones."""
+    mat = bpy.data.materials.get("R5_zipline_cable") or bpy.data.materials.new("R5_zipline_cable")
+    mat.diffuse_color = ZIPLINE_YELLOW
+    if not mat.get("r5_zip_v2"):
+        mat.use_nodes = True
+        bsdf = next((n for n in mat.node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        if bsdf is not None:
+            bsdf.inputs["Base Color"].default_value = ZIPLINE_YELLOW
+            bsdf.inputs["Roughness"].default_value = 0.45
+            if "Metallic" in bsdf.inputs:
+                bsdf.inputs["Metallic"].default_value = 0.0
+        mat["r5_zip_v2"] = True
+    return mat
+
+
 def _create_ziplines(ziplines, map_col, map_name, unit, offset):
     col = _get_child_collection(map_col, f"{map_name}_ziplines")
     cu = bpy.data.curves.new(f"{map_name}_ziplines", "CURVE")
@@ -287,9 +338,7 @@ def _create_ziplines(ziplines, map_col, map_name, unit, offset):
         sp.points.add(len(pts) - 1)
         for i, p in enumerate(pts):
             sp.points[i].co = (p[0] * unit - off[0], p[1] * unit - off[1], p[2] * unit - off[2], 1.0)
-    mat = bpy.data.materials.get("R5_zipline_cable") or bpy.data.materials.new("R5_zipline_cable")
-    mat.diffuse_color = (0.05, 0.05, 0.05, 1.0)
-    cu.materials.append(mat)
+    cu.materials.append(zipline_material())
     obj = bpy.data.objects.new(f"{map_name}_ziplines", cu)
     col.objects.link(obj)
     return obj
@@ -378,6 +427,7 @@ class R5_OT_import_map(bpy.types.Operator, ImportHelper):
         col.prop(s, "models_dir")
         col.label(text="(empty = '_models' folder next to the file)")
         col.prop(s, "instancing_mode")
+        col.prop(s, "auto_entities")
         col.prop(s, "ent_path")
         col.prop(s, "ent_files")
         col.prop(s, "import_world")

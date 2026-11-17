@@ -15,7 +15,7 @@ import bmesh
 import numpy as np
 from mathutils import Matrix
 
-from .castfile import GROUP_KEY, is_fx_model
+from .castfile import GROUP_KEY, is_fx_model, is_vfx_model, make_vfx
 
 SUPPORTED_EXT = (".cast", ".glb", ".gltf", ".fbx", ".obj", ".semodel", ".smd")
 LIB_COLLECTION = "APX_Library"
@@ -269,6 +269,11 @@ def ensure_model(key, files, settings, scene):
             # Light shaft / atmosphere volume: the whole model goes to the "fx" group
             for o in meshes:
                 o[GROUP_KEY] = "fx"
+        elif is_vfx_model(key):
+            # Energy dome / hologram shell: visible, but see-through
+            for o in meshes:
+                for slot in o.material_slots:
+                    make_vfx(slot.material)
 
         # A single file holding several LODs in its object names?
         groups = {}

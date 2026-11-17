@@ -347,9 +347,18 @@ def categorize(key, has_emissive):
 
 def scan(scene):
     """Sort the placed models into light types. Returns {cid: {key: (points, materials, colour, n_props)}}."""
+    from .regions import get_discs, outside_mask
     inst = _instances()
+    discs = get_discs(scene)
     found = {}
     for key, matrices in inst.items():
+        if len(discs):
+            # POIs shown (Regions / POI): only the props inside them get lights
+            pos = np.array([tuple(mw.translation) for mw in matrices], dtype=np.float32)
+            out = outside_mask(pos, discs)
+            matrices = [mw for mw, o in zip(matrices, out) if not o]
+            if not matrices:
+                continue
         objs = _model_lod0_objects(key)
         has_em = any(_is_emissive(ms.material) for o in objs for ms in o.material_slots)
         cid = categorize(key, has_em)
@@ -552,6 +561,7 @@ class R5_PT_lights(bpy.types.Panel):
     bl_category = "R5 Map Loader"
     bl_label = "City lights"
     bl_idname = "R5_PT_lights"
+    bl_order = 4                 # below Sky (ui.py)
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
@@ -595,6 +605,9 @@ class R5_PT_lights(bpy.types.Panel):
             row.operator("r5.lights_build", icon="LIGHT")
             row.operator("r5.lights_clear", text="", icon="TRASH")
             col.label(text="Lights near the 3D cursor first (Max)", icon="INFO")
+            from .regions import get_discs
+            if len(get_discs(context.scene)):
+                col.label(text="Only in the POIs shown (Regions / POI)", icon="SELECT_SUBTRACT")
 
 
 CLASSES = (R5_OT_lights_scan, R5_OT_lights_build, R5_OT_lights_clear, R5_PT_lights)

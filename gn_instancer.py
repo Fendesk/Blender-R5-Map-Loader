@@ -6,7 +6,7 @@ Geometry Nodes modifier that, for every point:
   - hides the prop when it is OUTSIDE THE FIELD OF VIEW (frustum culling),
   - hides the prop when it is TOO SMALL ON SCREEN (small far-away objects),
   - hides the prop beyond the culling distance (optional),
-  - hides the prop OUTSIDE THE ACTIVE REGION (APX_Region empty, see regions.py).
+  - hides the prop OUTSIDE THE ACTIVE REGION (APX_Region disc mesh, see regions.py).
 
 The probe is an empty that the timer moves onto the 3D view (or the camera):
   location = eye, rotation = view orientation (looking down -Z),
@@ -19,7 +19,7 @@ import bpy
 import numpy as np
 
 GROUP = "APX_Instancer"
-GROUP_VERSION = 4
+GROUP_VERSION = 5          # 5: region = disc mesh (several POIs)
 MAX_LEVELS = 5
 PROBE = "APX_LOD_Probe"
 
@@ -208,34 +208,71 @@ def _build(ng):
 
 def _region_fail_nodes(N, L, region_socket, position, loc):
     """True when the point is outside the active region.
-    Region empty: location = center, scale.x = radius (m), scale.z > 0.5 = enabled."""
+    Region object (regions.py): a mesh with one flat disc per shown POI, empty = whole map. A vertical ray
+    through the point tells whether it is inside one of the discs (any number of POIs, any radius)."""
     x, y = loc
-    oi = N.new("GeometryNodeObjectInfo"); oi.location = (x - 400, y)
+    oi = N.new("GeometryNodeObjectInfo"); oi.location = (x - 600, y)
     oi.transform_space = "RELATIVE"
     L.new(region_socket, oi.inputs["Object"])
-    sub = N.new("ShaderNodeVectorMath"); sub.operation = "SUBTRACT"; sub.location = (x - 200, y)
-    L.new(position, sub.inputs[0]); L.new(oi.outputs["Location"], sub.inputs[1])
-    mul = N.new("ShaderNodeVectorMath"); mul.operation = "MULTIPLY"; mul.location = (x, y)
-    L.new(sub.outputs[0], mul.inputs[0])
-    mul.inputs[1].default_value = (1.0, 1.0, 0.0)            # horizontal distance only
-    ln = N.new("ShaderNodeVectorMath"); ln.operation = "LENGTH"; ln.location = (x + 200, y)
-    L.new(mul.outputs[0], ln.inputs[0])
-    sep = N.new("ShaderNodeSeparateXYZ"); sep.location = (x, y - 200)
-    L.new(oi.outputs["Scale"], sep.inputs[0])
-    out = N.new("FunctionNodeCompare"); out.data_type = "FLOAT"; out.operation = "GREATER_THAN"
-    out.location = (x + 400, y)
-    L.new(ln.outputs["Value"], out.inputs[0]); L.new(sep.outputs[0], out.inputs[1])
+    size = N.new("GeometryNodeAttributeDomainSize"); size.location = (x - 300, y - 250)
+    L.new(oi.outputs["Geometry"], size.inputs["Geometry"])
+    # float compare: the first two inputs are A / B in every version (5.3 dropped the per-type sockets)
     on = N.new("FunctionNodeCompare"); on.data_type = "FLOAT"; on.operation = "GREATER_THAN"
-    on.location = (x + 400, y - 200)
-    L.new(sep.outputs[2], on.inputs[0]); on.inputs[1].default_value = 0.5
-    both = N.new("FunctionNodeBooleanMath"); both.operation = "AND"; both.location = (x + 600, y)
-    L.new(out.outputs[0], both.inputs[0]); L.new(on.outputs[0], both.inputs[1])
+    on.location = (x - 50, y - 250)
+    L.new(size.outputs["Face Count"], on.inputs[0]); on.inputs[1].default_value = 0.5
+    sep = N.new("ShaderNodeSeparateXYZ"); sep.location = (x - 400, y + 250)
+    L.new(position, sep.inputs[0])
+    top = N.new("ShaderNodeCombineXYZ"); top.location = (x - 200, y + 250)
+    L.new(sep.outputs[0], top.inputs[0]); L.new(sep.outputs[1], top.inputs[1])
+    top.inputs[2].default_value = 1.0e6
+    ray = N.new("GeometryNodeRaycast"); ray.location = (x, y + 100)
+    L.new(oi.outputs["Geometry"], ray.inputs["Target Geometry"])
+    L.new(top.outputs[0], ray.inputs["Source Position"])
+    ray.inputs["Ray Direction"].default_value = (0.0, 0.0, -1.0)
+    ray.inputs["Ray Length"].default_value = 2.0e6
+    miss = N.new("FunctionNodeBooleanMath"); miss.operation = "NOT"; miss.location = (x + 250, y + 100)
+    L.new(ray.outputs["Is Hit"], miss.inputs[0])
+    both = N.new("FunctionNodeBooleanMath"); both.operation = "AND"; both.location = (x + 450, y)
+    L.new(miss.outputs[0], both.inputs[0]); L.new(on.outputs[0], both.inputs[1])
     return both.outputs[0]
 
 
 def _ids(ng):
     return {it.name: it.identifier for it in ng.interface.items_tree
             if getattr(it, "item_type", "SOCKET") == "SOCKET" and it.in_out == "INPUT"}
+
+
+_MISSING = object()
+
+
+def mod_get(mod, ident, default=None):
+    """Value of a Geometry Nodes modifier input.
+    Blender <= 5.2: mod["Socket_N"] (ID property). Blender 5.3+: mod.properties.inputs.Socket_N.value."""
+    props = getattr(mod, "properties", None)
+    if props is not None and hasattr(props, "inputs"):
+        it = getattr(props.inputs, ident, None)
+        return getattr(it, "value", default) if it is not None else default
+    try:
+        return mod[ident]
+    except (KeyError, TypeError):
+        return default
+
+
+def mod_set(mod, ident, value):
+    """Set a Geometry Nodes modifier input (see mod_get). Returns True when the value changed."""
+    props = getattr(mod, "properties", None)
+    if props is not None and hasattr(props, "inputs"):
+        it = getattr(props.inputs, ident, None)
+        if it is None:
+            return False
+        if it.value != value:
+            it.value = value
+            return True
+        return False
+    if mod.get(ident, _MISSING) != value:
+        mod[ident] = value
+        return True
+    return False
 
 
 # --------------------------------------------------------------------------
@@ -301,11 +338,11 @@ def create_instancer(key, lods, placements_xf, collection, scene):
     mod = obj.modifiers.new("APX_Instancer", "NODES")
     mod.node_group = get_group()
     ids = _ids(mod.node_group)
-    mod[ids["Probe"]] = get_probe(scene)
-    mod[ids["Region"]] = get_region(scene)
+    mod_set(mod, ids["Probe"], get_probe(scene))
+    mod_set(mod, ids["Region"], get_region(scene))
     for i in range(MAX_LEVELS):
-        mod[ids[f"LOD{i}"]] = lods[i] if i < len(lods) else None
-    mod[ids["Levels"]] = min(len(lods), MAX_LEVELS)
+        mod_set(mod, ids[f"LOD{i}"], lods[i] if i < len(lods) else None)
+    mod_set(mod, ids["Levels"], min(len(lods), MAX_LEVELS))
     link_model_materials(obj, lods)
     collection.objects.link(obj)
     return obj
@@ -323,10 +360,7 @@ def link_model_materials(obj, lods=None):
         ids = _ids(mod.node_group)
         lods = []
         for i in range(MAX_LEVELS):
-            try:
-                lods.append(mod[ids[f"LOD{i}"]])
-            except (KeyError, TypeError):
-                lods.append(None)
+            lods.append(mod_get(mod, ids[f"LOD{i}"]) if f"LOD{i}" in ids else None)
     if not lods or lods[0] is None:
         return 0
     me = obj.data
@@ -387,13 +421,8 @@ def apply_settings(scene, force_level=None, min_screen=None):
             vals[f"D{i}"] = dists[i - 1] if i - 1 < len(dists) else 1e12
         changed = False
         for k, v in vals.items():
-            ident = ids[k]
-            if mod.get(ident) != v:
-                mod[ident] = v
-                changed = True
-        if mod.get(ids["Region"]) != region:
-            mod[ids["Region"]] = region
-            changed = True
+            changed |= mod_set(mod, ids[k], v)
+        changed |= mod_set(mod, ids["Region"], region)
         if changed:
             o.update_tag()
             n += 1

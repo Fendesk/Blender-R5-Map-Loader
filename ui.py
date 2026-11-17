@@ -10,7 +10,7 @@ class _Base:
 
 
 class R5_PT_import(_Base, bpy.types.Panel):
-    """Import: from the game (R5Reloaded / R5Flowstate install) or from exported files, in one panel."""
+    """Import exported maps (RSXreloaded / Legion+ / RSX), entity files and ReMap scripts."""
     bl_label = "Import"
     bl_idname = "R5_PT_import"
     bl_order = 0
@@ -18,23 +18,14 @@ class R5_PT_import(_Base, bpy.types.Panel):
     def draw(self, context):
         s = context.scene.r5_settings
         col = self.layout.column()
-        if not hasattr(s, "import_source"):
+        if not hasattr(s, "auto_entities"):
             # settings class of the previous version still loaded (update installed without restarting)
             col.label(text="Restart Blender to finish the update", icon="ERROR")
             return
-        col.row().prop(s, "import_source", expand=True)
-        if s.import_source == "GAME":
-            from . import game_import
-            box = col.box()
-            box.label(text="Experimental feature (beta)", icon="EXPERIMENTAL")
-            box.label(text="Results may be incomplete: missing models,")
-            box.label(text="textures, or approximate terrain (R5Flowstate).")
-            game_import.draw_game(col, s)
-        else:
-            col.prop(s, "models_dir", text="Models")
-            row = col.row()
-            row.scale_y = 1.3
-            row.operator("r5.import_map", text="Import files (.mprt .ent .vpk .nut .cast...)", icon="IMPORT")
+        col.prop(s, "models_dir", text="Models")
+        row = col.row()
+        row.scale_y = 1.3
+        row.operator("r5.import_map", text="Import files (.mprt .ent .vpk .nut .cast...)", icon="IMPORT")
         col.prop(s, "instancing_mode", text="")
 
 
@@ -43,31 +34,14 @@ class _ImportSub(_Base):
     bl_options = {"DEFAULT_CLOSED"}
 
 
-class R5_PT_import_tools(_ImportSub, bpy.types.Panel):
-    bl_label = "Tools & cache"
-    bl_idname = "R5_PT_import_tools"
-
-    @classmethod
-    def poll(cls, context):
-        s = context.scene.r5_settings
-        return getattr(s, "import_source", "GAME") == "GAME"
-
-    def draw(self, context):
-        from . import game_import
-        game_import.draw_game_tools(self.layout.column(), context.scene.r5_settings)
-
-
 class R5_PT_import_ents(_ImportSub, bpy.types.Panel):
     bl_label = "Entities (dynamic props, POIs)"
     bl_idname = "R5_PT_import_ents"
 
-    @classmethod
-    def poll(cls, context):
-        return getattr(context.scene.r5_settings, "import_source", "FILES") == "FILES"
-
     def draw(self, context):
         s = context.scene.r5_settings
         col = self.layout.column()
+        col.prop(s, "auto_entities")
         col.prop(s, "ent_path", text="")
         col.prop(s, "ent_files")
         col.label(text="R5Reloaded: vpk/englishserver_<map>.bsp.pak000_dir.vpk")
@@ -125,6 +99,7 @@ class R5_PT_import_options(_ImportSub, bpy.types.Panel):
 
 class R5_PT_visibility(_Base, bpy.types.Panel):
     bl_label = "Visibility"
+    bl_order = 1
     bl_idname = "R5_PT_visibility"
 
     def draw(self, context):
@@ -167,16 +142,16 @@ class R5_PT_models(_Base, bpy.types.Panel):
 
 class R5_PT_regions(_Base, bpy.types.Panel):
     bl_label = "Regions / POI"
+    bl_order = 2
     bl_idname = "R5_PT_regions"
 
     def draw(self, context):
         from . import regions
         s = context.scene.r5_settings
         col = self.layout.column()
-        active = regions.region_active(context.scene)
-        if active:
-            r = regions.get_region(context.scene)
-            col.label(text=f"Showing a region ({r.scale.x:.0f} m)", icon="SELECT_SUBTRACT")
+        n = len(regions.get_discs(context.scene))
+        if n:
+            col.label(text=f"Showing {n} area{'s' if n > 1 else ''} of the map", icon="SELECT_SUBTRACT")
         else:
             col.label(text="Showing the whole map", icon="WORLD")
         row = col.row()
@@ -186,12 +161,17 @@ class R5_PT_regions(_Base, bpy.types.Panel):
         side.operator("r5.poi_remove", text="", icon="REMOVE")
         side.separator()
         side.operator("r5.poi_goto", text="", icon="VIEW_CAMERA")
+        side.separator()
+        side.operator("r5.poi_check", text="", icon="CHECKBOX_HLT").state = True
+        side.operator("r5.poi_check", text="", icon="CHECKBOX_DEHLT").state = False
         if 0 <= s.poi_index < len(s.pois):
             p = s.pois[s.poi_index]
             col.prop(p, "radius")
         col.prop(s, "region_scale")
+        checked = sum(1 for p in s.pois if p.use)
         row = col.row(align=True)
-        row.operator("r5.region_poi", icon="SELECT_SUBTRACT")
+        row.operator("r5.region_poi", icon="SELECT_SUBTRACT",
+                     text=f"Show {checked} POIs" if checked > 1 else "Show POI")
         row.operator("r5.region_clear", icon="WORLD")
         col.operator("r5.region_cursor", icon="PIVOT_CURSOR")
         row = col.row(align=True)
@@ -202,6 +182,7 @@ class R5_PT_regions(_Base, bpy.types.Panel):
 
 class R5_PT_lod(_Base, bpy.types.Panel):
     bl_label = "LOD & streaming"
+    bl_order = 5
     bl_idname = "R5_PT_lod"
 
     def draw_header(self, context):
@@ -267,6 +248,7 @@ class R5_PT_lod_import(_Base, bpy.types.Panel):
 
 class R5_PT_sky(_Base, bpy.types.Panel):
     bl_label = "Sky"
+    bl_order = 3                 # below Regions / POI, above City lights (lights.py, bl_order 4)
     bl_idname = "R5_PT_sky"
 
     def draw(self, context):
@@ -330,6 +312,7 @@ class R5_PT_sky(_Base, bpy.types.Panel):
 
 class R5_PT_render(_Base, bpy.types.Panel):
     bl_label = "Render (Cycles)"
+    bl_order = 6
     bl_idname = "R5_PT_render"
 
     def draw(self, context):
@@ -356,6 +339,7 @@ class R5_PT_render(_Base, bpy.types.Panel):
 
 class R5_PT_optimize(_Base, bpy.types.Panel):
     bl_label = "Optimization"
+    bl_order = 7
     bl_idname = "R5_PT_optimize"
     bl_options = {"DEFAULT_CLOSED"}
 
@@ -378,7 +362,7 @@ class R5_PT_optimize(_Base, bpy.types.Panel):
         box.label(text=f"LOD0 triangles (unique): {tris:,}")
 
 
-CLASSES = (R5_PT_import, R5_PT_import_tools, R5_PT_import_ents, R5_PT_import_geometry, R5_PT_import_cast,
+CLASSES = (R5_PT_import, R5_PT_import_ents, R5_PT_import_geometry, R5_PT_import_cast,
            R5_PT_import_options, R5_PT_visibility, R5_PT_models, R5_PT_regions, R5_PT_lod, R5_PT_lod_import,
            R5_PT_sky, R5_PT_render, R5_PT_optimize)
 

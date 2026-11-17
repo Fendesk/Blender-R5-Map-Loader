@@ -1,12 +1,13 @@
-"""Partial loading: show only one part of a loaded map (a point of interest, a grid sector,
+"""Partial loading: show only part of a loaded map (one or several points of interest, grid sectors,
 or a disc around the 3D cursor).
 
-The active region is a single empty, "APX_Region":
-  location = center, scale.x = radius in meters, scale.z = 1 (enabled) / 0 (disabled).
-  - Props (Geometry Nodes instancers) read it and drop every point outside the disc.
+The active region is a mesh object, "APX_Region", holding one flat disc per shown POI (no face = the whole
+map). The disc list (x, y, radius in meters) is also kept in its "r5_discs" property.
+  - Props (Geometry Nodes instancers) cast a vertical ray against it and drop every point outside the discs.
   - Map geometry and zipline cables get an "APX_RegionClip" modifier that deletes what is outside.
-Moving to another region only moves this empty: nothing is re-imported, and Cycles / EEVEE
-only receive the visible part.
+  - City lights are only created inside the region.
+Changing the region only rebuilds this small mesh: nothing is re-imported, and Cycles / EEVEE only receive
+the visible part.
 """
 
 import math
@@ -14,12 +15,15 @@ import string
 
 import bpy
 import numpy as np
-from bpy.props import FloatProperty, FloatVectorProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, FloatProperty, FloatVectorProperty, IntProperty, StringProperty
 from mathutils import Vector
 
 REGION = "APX_Region"
 CLIP_GROUP = "APX_RegionClip"
 CLIP_MOD = "APX_RegionClip"
+CLIP_VERSION = 2          # 2: disc mesh
+DISCS = "r5_discs"
+_SEGMENTS = 64
 
 
 # --------------------------------------------------------------------------
@@ -29,21 +33,85 @@ class R5_POI(bpy.types.PropertyGroup):
     center: FloatVectorProperty(name="Center", size=3, subtype="TRANSLATION")
     radius: FloatProperty(name="Radius", default=150.0, min=1.0, subtype="DISTANCE")
     kind: StringProperty(name="Kind")
+    use: BoolProperty(name="Show", default=False,
+                      description="Part of the POIs shown by 'Show checked POIs' (several at once)")
 
 
 def get_region(scene):
     r = bpy.data.objects.get(REGION)
+    old = None
+    if r is not None and r.type != "MESH":
+        # empty of add-on versions < 0.13 (one disc: location + scale.x, scale.z = enabled): converted
+        old = [(tuple(r.location), r.scale.x)] if r.scale.z > 0.5 else []
+        bpy.data.objects.remove(r, do_unlink=True)
+        r = None
     if r is None:
-        r = bpy.data.objects.new(REGION, None)
-        r.empty_display_type = "CIRCLE"
-        r.empty_display_size = 1.0
+        r = bpy.data.objects.new(REGION, bpy.data.meshes.new(REGION))
+        r.display_type = "WIRE"
         r.hide_render = True
         r.hide_select = True
-        r.scale = (100.0, 100.0, 0.0)
+        r[DISCS] = [0.0]          # [count, x, y, radius, ...]
     if r.name not in scene.collection.objects:
         scene.collection.objects.link(r)
         _show(r, False)
+    if old is not None:
+        _write_discs(r, old)
+        _relink_modifiers(scene, r)
     return r
+
+
+def _relink_modifiers(scene, r):
+    from .gn_instancer import _ids, mod_set
+    for o in scene.objects:
+        for m in o.modifiers:
+            if m.type == "NODES" and m.node_group is not None:
+                ident = _ids(m.node_group).get("Region")
+                if ident:
+                    mod_set(m, ident, r)
+
+
+def _write_discs(r, discs):
+    """discs: [(center xyz, radius)]. Rebuilds the disc mesh."""
+    verts, faces = [], []
+    flat = [float(len(discs))]
+    for c, rad in discs:
+        base = len(verts)
+        for i in range(_SEGMENTS):
+            a = 2.0 * math.pi * i / _SEGMENTS
+            verts.append((c[0] + rad * math.cos(a), c[1] + rad * math.sin(a), c[2]))
+        faces.append(list(range(base, base + _SEGMENTS)))
+        flat += [float(c[0]), float(c[1]), float(rad)]
+    me = r.data
+    me.clear_geometry()
+    me.from_pydata(verts, [], faces)
+    me.update()
+    r[DISCS] = flat
+    r.update_tag()
+
+
+def get_discs(scene=None):
+    """(n, 3) array of the shown discs: x, y, radius (meters). Empty = whole map."""
+    r = bpy.data.objects.get(REGION)
+    if r is None or r.type != "MESH":
+        if r is not None and r.scale.z > 0.5:      # not converted yet
+            return np.array([[r.location.x, r.location.y, r.scale.x]], dtype=np.float32)
+        return np.zeros((0, 3), dtype=np.float32)
+    flat = list(r.get(DISCS, [0.0]))
+    n = int(flat[0]) if flat else 0
+    return np.array(flat[1:1 + n * 3], dtype=np.float32).reshape(-1, 3)
+
+
+def outside_mask(pos, discs=None):
+    """True for the XY points outside every disc (all False when no region is active)."""
+    if discs is None:
+        discs = get_discs()
+    pos = np.asarray(pos, dtype=np.float32).reshape(-1, 3)
+    if not len(discs):
+        return np.zeros(len(pos), dtype=bool)
+    inside = np.zeros(len(pos), dtype=bool)
+    for x, y, rad in discs:
+        inside |= (pos[:, 0] - x) ** 2 + (pos[:, 1] - y) ** 2 <= rad * rad
+    return ~inside
 
 
 def _show(obj, state):
@@ -55,8 +123,7 @@ def _show(obj, state):
 
 
 def region_active(scene):
-    r = bpy.data.objects.get(REGION)
-    return r is not None and r.scale.z > 0.5
+    return len(get_discs(scene)) > 0
 
 
 REGION_HIDDEN = "r5_region_hidden"
@@ -79,7 +146,7 @@ def _bbox_xy(o):
     return bb
 
 
-def _hide_outside(scene, center, radius):
+def _hide_outside(scene, discs):
     """Fully disable the geometry objects / prop models that do not touch the region, so that
     Cycles and EEVEE do not even load their materials and textures."""
     n = 0
@@ -89,9 +156,13 @@ def _hide_outside(scene, center, radius):
         bb = _bbox_xy(o)
         if bb is None:
             continue
-        dx = max(bb[0] - center.x, 0.0, center.x - bb[2])
-        dy = max(bb[1] - center.y, 0.0, center.y - bb[3])
-        outside = dx * dx + dy * dy > radius * radius
+        outside = True
+        for cx, cy, radius in discs:
+            dx = max(bb[0] - cx, 0.0, cx - bb[2])
+            dy = max(bb[1] - cy, 0.0, cy - bb[3])
+            if dx * dx + dy * dy <= radius * radius:
+                outside = False
+                break
         if outside and not o.hide_viewport:
             o.hide_viewport = True
             o.hide_render = True
@@ -112,14 +183,14 @@ def _restore_hidden(scene):
             del o[REGION_HIDDEN]
 
 
-def set_region(scene, center, radius):
+def set_region(scene, discs):
+    """Show only these discs: [(center xyz, radius in meters)]."""
     from . import visibility
     r = get_region(scene)
-    r.location = center
-    r.scale = (radius, radius, 1.0)
-    _show(r, True)
+    _write_discs(r, discs)
+    _show(r, False)            # never drawn: the discs would cover the POIs (the node groups still read it)
     ensure_clip_modifiers(scene)
-    _hide_outside(scene, Vector(center), radius)
+    _hide_outside(scene, get_discs(scene))
     visibility.apply(scene)
     _after_change(scene)
 
@@ -127,7 +198,7 @@ def set_region(scene, center, radius):
 def clear_region(scene):
     from . import visibility
     r = get_region(scene)
-    r.scale = (r.scale.x, r.scale.y, 0.0)
+    _write_discs(r, [])
     _show(r, False)
     _restore_hidden(scene)
     visibility.apply(scene)
@@ -140,6 +211,13 @@ def _after_change(scene):
     for o in scene.objects:
         if "apx_gn" in o or o.modifiers.get(CLIP_MOD):
             o.update_tag()
+    # City lights already created: rebuilt for the new region
+    try:
+        from . import lights
+        if any(c.created for c in scene.r5_settings.light_cats):
+            lights.build(scene)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[R5] city lights after a region change: {exc}")
 
 
 # --------------------------------------------------------------------------
@@ -147,10 +225,15 @@ def _after_change(scene):
 # --------------------------------------------------------------------------
 def get_clip_group():
     ng = bpy.data.node_groups.get(CLIP_GROUP)
-    if ng is not None:
+    if ng is not None and ng.get("apx_ver") == CLIP_VERSION:
         return ng
+    if ng is not None:                       # older version: rebuilt in place (same sockets)
+        ng.nodes.clear()
+        ng.interface.clear()
     from .gn_instancer import _region_fail_nodes
-    ng = bpy.data.node_groups.new(CLIP_GROUP, "GeometryNodeTree")
+    if ng is None:
+        ng = bpy.data.node_groups.new(CLIP_GROUP, "GeometryNodeTree")
+    ng["apx_ver"] = CLIP_VERSION
     ng.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
     ng.interface.new_socket("Region", in_out="INPUT", socket_type="NodeSocketObject")
     ng.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
@@ -184,8 +267,8 @@ def ensure_clip_modifiers(scene):
         if mod is None:
             mod = o.modifiers.new(CLIP_MOD, "NODES")
             mod.node_group = ng
-        if mod.get(ident) != region:
-            mod[ident] = region
+        from .gn_instancer import mod_set
+        mod_set(mod, ident, region)
 
 
 # --------------------------------------------------------------------------
@@ -269,19 +352,42 @@ def add_grid(scene, n):
 # --------------------------------------------------------------------------
 # Operators
 # --------------------------------------------------------------------------
+def shown_pois(s):
+    """The checked POIs, or the selected one when none is checked."""
+    pois = [p for p in s.pois if p.use]
+    if not pois and 0 <= s.poi_index < len(s.pois):
+        pois = [s.pois[s.poi_index]]
+    return pois
+
+
 class R5_OT_region_poi(bpy.types.Operator):
-    """Show only the selected point of interest (everything else is hidden, nothing is re-imported)"""
+    """Show only the checked points of interest (or the selected one when none is checked). Everything else is
+    hidden, nothing is re-imported"""
     bl_idname = "r5.region_poi"
-    bl_label = "Show only this POI"
+    bl_label = "Show checked POIs"
 
     def execute(self, context):
         s = context.scene.r5_settings
-        if not (0 <= s.poi_index < len(s.pois)):
-            self.report({"WARNING"}, "Select a POI in the list")
+        pois = shown_pois(s)
+        if not pois:
+            self.report({"WARNING"}, "Check POIs in the list (or select one)")
             return {"CANCELLED"}
-        p = s.pois[s.poi_index]
-        set_region(context.scene, Vector(p.center), p.radius * s.region_scale)
-        self.report({"INFO"}, f"Region: {p.name} ({p.radius * s.region_scale:.0f} m)")
+        set_region(context.scene, [(tuple(p.center), p.radius * s.region_scale) for p in pois])
+        names = ", ".join(p.name for p in pois[:4]) + ("..." if len(pois) > 4 else "")
+        self.report({"INFO"}, f"Region: {len(pois)} POI(s): {names}")
+        return {"FINISHED"}
+
+
+class R5_OT_poi_check(bpy.types.Operator):
+    """Check / uncheck every POI of the list"""
+    bl_idname = "r5.poi_check"
+    bl_label = "Check all POIs"
+
+    state: BoolProperty(default=True)
+
+    def execute(self, context):
+        for p in context.scene.r5_settings.pois:
+            p.use = self.state
         return {"FINISHED"}
 
 
@@ -292,7 +398,7 @@ class R5_OT_region_cursor(bpy.types.Operator):
 
     def execute(self, context):
         s = context.scene.r5_settings
-        set_region(context.scene, context.scene.cursor.location.copy(), s.poi_default_radius * s.region_scale)
+        set_region(context.scene, [(tuple(context.scene.cursor.location), s.poi_default_radius * s.region_scale)])
         return {"FINISHED"}
 
 
@@ -376,11 +482,12 @@ class R5_UL_pois(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         icon = {"zone": "BOOKMARKS", "loot": "PACKAGE", "grid": "MESH_GRID", "user": "PINNED"}.get(item.kind, "DOT")
         row = layout.row(align=True)
+        row.prop(item, "use", text="")
         row.prop(item, "name", text="", emboss=False, icon=icon)
         row.label(text=f"{item.radius:.0f} m")
 
 
-CLASSES = (R5_POI, R5_OT_region_poi, R5_OT_region_cursor, R5_OT_region_clear, R5_OT_poi_goto,
+CLASSES = (R5_POI, R5_OT_region_poi, R5_OT_poi_check, R5_OT_region_cursor, R5_OT_region_clear, R5_OT_poi_goto,
            R5_OT_poi_add, R5_OT_poi_remove, R5_OT_poi_grid, R5_UL_pois)
 
 

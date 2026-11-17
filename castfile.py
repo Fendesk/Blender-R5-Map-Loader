@@ -86,7 +86,7 @@ _BM_RE = re.compile(r"_bm($|_)")
 # ... which are still real overlays when their name says so
 _BM_OVERLAY_RE = re.compile(r"transparent|decal|_b2t($|_)|_bt($|_)")
 
-MAT_VERSION = 12
+MAT_VERSION = 14
 
 
 def material_group(name):
@@ -631,6 +631,94 @@ def make_additive(mat, strength=1.0):
     mat["r5_additive"] = True
 
 
+def is_vfx_model(key):
+    """Effect shells drawn by a VFX shader in game (vfx_moon_mu1_z07_dome: the energy dome of Broken Moon)."""
+    return key.lower().startswith("vfx_")
+
+
+def make_vfx(mat):
+    """See-through, faintly glowing surface for the materials of the vfx_* models: a mix of transparent and
+    emission, weighted by the opacity texture (otherwise a low constant). The game tints them with shader
+    constants that are not in the exports: the textures are grey-scale, so the glow is a light blue."""
+    if mat is None or not mat.use_nodes or mat.get("r5_vfx"):
+        return
+    nt = mat.node_tree
+    imgs = {n.label: n.image for n in nt.nodes if n.type == "TEX_IMAGE" and n.image is not None}
+    nt.nodes.clear()
+    N, L = nt.nodes, nt.links
+    out = N.new("ShaderNodeOutputMaterial"); out.location = (700, 0)
+    mix = N.new("ShaderNodeMixShader"); mix.location = (500, 0)
+    tr = N.new("ShaderNodeBsdfTransparent"); tr.location = (250, 120)
+    em = N.new("ShaderNodeEmission"); em.location = (250, -80)
+    em.inputs["Strength"].default_value = 2.0
+    col = imgs.get("emissive") or imgs.get("albedo")
+    tint = _mix_rgba(nt, (50, -80), "MULTIPLY")
+    _sock(tint.inputs, "Factor_Float").default_value = 1.0
+    _sock(tint.inputs, "B_Color").default_value = (0.55, 0.8, 1.0, 1.0)
+    _sock(tint.inputs, "A_Color").default_value = (1.0, 1.0, 1.0, 1.0)
+    if col is not None:
+        t = N.new("ShaderNodeTexImage"); t.image = col; t.label = "albedo"; t.location = (-300, -80)
+        L.new(t.outputs["Color"], _sock(tint.inputs, "A_Color"))
+    L.new(_sock(tint.outputs, "Result_Color"), em.inputs["Color"])
+    op = imgs.get("opacity")
+    if op is not None:
+        o = N.new("ShaderNodeTexImage"); o.image = op; o.label = "opacity"; o.location = (-300, 220)
+        k = N.new("ShaderNodeMath"); k.operation = "MULTIPLY"; k.location = (250, 300)
+        k.inputs[1].default_value = 0.6
+        L.new(o.outputs["Color"], k.inputs[0])
+        L.new(k.outputs[0], mix.inputs["Fac"])
+    else:
+        mix.inputs["Fac"].default_value = 0.12
+    L.new(tr.outputs[0], mix.inputs[1])
+    L.new(em.outputs[0], mix.inputs[2])
+    L.new(mix.outputs[0], out.inputs["Surface"])
+    _set_render_method(mat, "BLENDED")
+    mat.use_backface_culling = False
+    if hasattr(mat, "use_transparency_overlap"):
+        mat.use_transparency_overlap = False
+    if hasattr(mat, "shadow_method"):
+        try:
+            mat.shadow_method = "NONE"
+        except TypeError:
+            pass
+    if hasattr(mat, "use_transparent_shadow"):
+        mat.use_transparent_shadow = True
+    mat.diffuse_color = (0.55, 0.8, 1.0, 0.15)
+    nt.nodes.active = mix
+    mat["r5_vfx"] = True
+
+
+UP_ATTR = "r5_up"
+
+
+def _upward(nt, loc, lo=0.7, hi=0.95):
+    """0..1: how much the surface looks up in the world (instances included)."""
+    N, L = nt.nodes, nt.links
+    x, y = loc
+    geo = N.new("ShaderNodeNewGeometry"); geo.location = (x - 360, y)
+    sep = N.new("ShaderNodeSeparateXYZ"); sep.location = (x - 180, y)
+    L.new(geo.outputs["Normal"], sep.inputs[0])
+    up = N.new("ShaderNodeMapRange"); up.location = (x, y)
+    up.interpolation_type = "SMOOTHSTEP"
+    up.inputs["From Min"].default_value = lo
+    up.inputs["From Max"].default_value = hi
+    L.new(sep.outputs["Z"], up.inputs["Value"])
+    return up.outputs["Result"]
+
+
+def _layer_weight(nt, alpha, loc):
+    """Weight of layer 2: the vertex alpha, or, on meshes flagged UP_ATTR (props without vertex colours), the
+    faces looking up (moss on top of the rocks instead of moss-covered rocks)."""
+    N, L = nt.nodes, nt.links
+    x, y = loc
+    flag = N.new("ShaderNodeAttribute"); flag.attribute_name = UP_ATTR; flag.location = (x - 200, y + 200)
+    mix = N.new("ShaderNodeMix"); mix.data_type = "FLOAT"; mix.location = (x + 200, y + 100)
+    L.new(flag.outputs["Fac"], _sock(mix.inputs, "Factor_Float"))
+    L.new(alpha, _sock(mix.inputs, "A_Float"))
+    L.new(_upward(nt, (x, y + 400)), _sock(mix.inputs, "B_Float"))
+    return _sock(mix.outputs, "Result_Float")
+
+
 def get_material(cast, h, settings):
     cm = cast.materials.get(h)
     name = cm.name if cm else "r5_default"
@@ -644,6 +732,7 @@ def get_material(cast, h, settings):
         if "r5_additive" in mat:
             del mat["r5_additive"]
     mat["apx_cast"] = MAT_VERSION
+    mat["r5_blend"] = False
     group = material_group(name)
     if group:
         mat[GROUP_KEY] = group
@@ -669,7 +758,8 @@ def get_material(cast, h, settings):
         # Decals keep their opacity in a separate grey-scale texture (opacityMultiply). With hashed file
         # names, look for it in the extra slots.
         for slot, h2 in unnamed:
-            if slot.lower() in ("emissive", "ao", "cavity"):
+            # Legion+ positional names, or RSXreloaded's unnamed "slot<n>"
+            if slot.lower() in ("emissive", "ao", "cavity") or re.fullmatch(r"slot\d+", slot.lower()):
                 img = _image(cast.texture_path(h2), True)
                 if img is not None and _mask_like(img):
                     roles["opacity"] = h2
@@ -704,13 +794,29 @@ def get_material(cast, h, settings):
     vctint = is_vctint(name) or (alb is not None and not blend and group not in ("fx", "particle", "tool", "trigger")
                                  and not _FOLIAGE_RE.search(name.lower()))
     mat["r5_vctint"] = bool(vctint)
+    # Two layers: the vertex ALPHA is the weight of layer 2 (measured on World's Edge: where two blend
+    # materials meet, alpha is 0 when they share layer 1 and 255 when they share layer 2). Without it the
+    # ground showed hard borders between meshes.
+    alb2 = tex("albedo2", False)[0] if blend and alb is not None and not overlay else None
+    mat["r5_blend"] = alb2 is not None
     col_attr = None
-    if overlay or vctint:
+    if overlay or vctint or alb2 is not None:
         col_attr = nt.nodes.new("ShaderNodeVertexColor")
         col_attr.layer_name = "Col"
         col_attr.location = (x, y + 300)
+    layer_w = _layer_weight(nt, col_attr.outputs["Alpha"], (x - 300, y + 300)) if alb2 is not None else None
+
+    def layered(a_out, b_out, loc):
+        m = _mix_rgba(nt, loc, "MIX")
+        links.new(layer_w, _sock(m.inputs, "Factor_Float"))
+        links.new(a_out, _sock(m.inputs, "A_Color"))
+        links.new(b_out, _sock(m.inputs, "B_Color"))
+        return _sock(m.outputs, "Result_Color")
+
     spec = None if blend else tex("specular", False)[0]
     base_out = alb.outputs["Color"] if alb else None
+    if alb2 is not None:
+        base_out = layered(base_out, alb2.outputs["Color"], (x + 300, y + 600))
     if base_out is not None and vctint and col_attr is not None:
         mul = _mix_rgba(nt, (x + 300, y + 450), "MULTIPLY")
         _sock(mul.inputs, "Factor_Float").default_value = 1.0
@@ -777,13 +883,21 @@ def get_material(cast, h, settings):
 
     nrm, _ = tex("normal", True)
     if nrm:
-        _normal_chain(nt, nrm, bsdf, settings.cast_flip_normal_green, (x + 300, y + 300))
+        n_out = nrm.outputs["Color"]
+        nrm2 = tex("normal2", True)[0] if alb2 is not None else None
+        if nrm2 is not None:
+            n_out = layered(n_out, nrm2.outputs["Color"], (x + 150, y + 450))
+        _normal_chain(nt, n_out, bsdf, settings.cast_flip_normal_green, (x + 300, y + 300))
 
     gl, _ = tex("gloss", True)
     if gl:
+        g_out = gl.outputs["Color"]
+        gl2 = tex("gloss2", True)[0] if alb2 is not None else None
+        if gl2 is not None:
+            g_out = layered(g_out, gl2.outputs["Color"], (x + 150, y + 450))
         inv = nt.nodes.new("ShaderNodeInvert")
         inv.location = (x + 300, y + 300)
-        links.new(gl.outputs["Color"], inv.inputs["Color"])
+        links.new(g_out, inv.inputs["Color"])
         links.new(inv.outputs["Color"], bsdf.inputs["Roughness"])
     else:
         rough, _ = tex("roughness", True)
@@ -835,12 +949,58 @@ def _set_input(node, names, value):
     return False
 
 
+def _img_stats(img, size=32):
+    """(mean RGB, luminance std) of an image, on a small copy."""
+    if img is None:
+        return None
+    small = None
+    try:
+        if not img.size[0]:
+            return None
+        small = img.copy()
+        small.scale(size, size)
+        px = np.empty(size * size * 4, np.float32)
+        small.pixels.foreach_get(px)
+        rgb = px.reshape(-1, 4)[:, :3]
+        return rgb.mean(0), float((rgb @ np.array([0.3, 0.59, 0.11], np.float32)).std())
+    except (RuntimeError, ValueError, AttributeError):
+        return None
+    finally:
+        if small is not None:
+            try:
+                bpy.data.images.remove(small)
+            except (RuntimeError, ReferenceError):
+                pass
+
+
+def _ice_detail(cast, cm, roles):
+    """The ice colour texture: among the spec texture and the unnamed extra textures of the ice shader, the
+    blue-ish one with the most detail (desertlands_ice_03_wld_bright...: blue ice with cracks, slot 8; the spec
+    texture is only a cloudy tint, which gave a flat colour)."""
+    cands = [roles["specular"]] if roles.get("specular") else []
+    cands += [h for s, h in cm.slots.items() if re.fullmatch(r"slot\d+", s.lower())]
+    best, score = None, -1.0
+    for h in cands:
+        st = _img_stats(_image(cast.texture_path(h), False))
+        if st is None:
+            continue
+        mean, std = st
+        if mean[2] - mean[0] < 0.04 or mean.mean() > 0.75:      # not bluish, or a white snow map
+            continue
+        if std > score:
+            best, score = h, std
+    return best
+
+
 def _build_ice(mat, nt, bsdf, cast, cm, settings):
-    """Ice shader. Returns False when the textures are not the expected ones (normal material then)."""
+    """Ice shader (+ its snow layer 2). Returns False when the textures are not the expected ones."""
     slots = list(cm.slots.items())
+    alb2_h = normal2_h = None
     if any(role_from_filename(cast.texture_path(h2)) for _s, h2 in slots):
         roles = texture_roles(cast, cm, mat.name)[0]
-        tint_h, normal_h, gloss_h = roles.get("specular"), roles.get("normal"), roles.get("gloss")
+        tint_h = _ice_detail(cast, cm, roles) or roles.get("specular")
+        normal_h, gloss_h = roles.get("normal"), roles.get("gloss")
+        alb2_h, normal2_h = roles.get("albedo2"), roles.get("normal2")
     elif len(slots) >= 7:
         # two-layer layout [albedo, albedo2, normal, normal2, gloss, gloss2, ice colour]
         tint_h, normal_h, gloss_h = slots[6][1], slots[2][1], slots[4][1]
@@ -852,17 +1012,39 @@ def _build_ice(mat, nt, bsdf, cast, cm, settings):
     N, L = nt.nodes, nt.links
     x, y = -1100, 300
     tint = N.new("ShaderNodeTexImage"); tint.image = tint_img; tint.label = "albedo"; tint.location = (x, y)
-    # cloudy blue-grey (mean ~0.31/0.39/0.44) -> brighter, then pulled towards a light ice blue
+    # blue-grey ice texture (mean ~0.35/0.44/0.51) -> brighter, then pulled a little towards a light ice blue
     hsv = N.new("ShaderNodeHueSaturation"); hsv.location = (x + 300, y)
-    hsv.inputs["Value"].default_value = 1.7
+    hsv.inputs["Value"].default_value = 1.5
     L.new(tint.outputs["Color"], hsv.inputs["Color"])
     mix = N.new("ShaderNodeMix"); mix.data_type = "RGBA"; mix.location = (x + 500, y)
-    _sock(mix.inputs, "Factor_Float").default_value = 0.35
+    _sock(mix.inputs, "Factor_Float").default_value = 0.2
     L.new(hsv.outputs["Color"], _sock(mix.inputs, "A_Color"))
     _sock(mix.inputs, "B_Color").default_value = (*_ICE_COLOR, 1.0)
-    L.new(_sock(mix.outputs, "Result_Color"), bsdf.inputs["Base Color"])
+    color_out = _sock(mix.outputs, "Result_Color")
     nt.nodes.active = tint
 
+    # Layer 2 (snow) where the vertex alpha says so, like the other two-layer materials
+    snow_img = _image(cast.texture_path(alb2_h), False) if alb2_h else None
+    w = None
+    if snow_img is not None:
+        col = N.new("ShaderNodeVertexColor"); col.layer_name = "Col"; col.location = (x, y + 300)
+        w = _layer_weight(nt, col.outputs["Alpha"], (x - 300, y + 300))
+        if "zup" in mat.name.lower():
+            # "..._zup_bm": the snow only settles on faces looking up (the ice walls of the spikes stay ice,
+            # their vertex alpha alone is 255)
+            wm = N.new("ShaderNodeMath"); wm.operation = "MULTIPLY"; wm.location = (x + 240, y + 450)
+            L.new(w, wm.inputs[0]); L.new(_upward(nt, (x + 60, y + 900), 0.5, 0.85), wm.inputs[1])
+            w = wm.outputs[0]
+        s = N.new("ShaderNodeTexImage"); s.image = snow_img; s.label = "albedo2"; s.location = (x, y + 600)
+        m2 = _mix_rgba(nt, (x + 700, y), "MIX")
+        L.new(w, _sock(m2.inputs, "Factor_Float"))
+        L.new(color_out, _sock(m2.inputs, "A_Color"))
+        L.new(s.outputs["Color"], _sock(m2.inputs, "B_Color"))
+        color_out = _sock(m2.outputs, "Result_Color")
+        mat["r5_blend"] = True
+    L.new(color_out, bsdf.inputs["Base Color"])
+
+    rough_out = None
     gloss_img = _image(cast.texture_path(gloss_h), True) if gloss_h else None
     if gloss_img is not None:
         g = N.new("ShaderNodeTexImage"); g.image = gloss_img; g.label = "gloss"; g.location = (x, y - 300)
@@ -870,14 +1052,34 @@ def _build_ice(mat, nt, bsdf, cast, cm, settings):
         mr.inputs["To Min"].default_value = 0.35    # gloss 0 (cracks)
         mr.inputs["To Max"].default_value = 0.04    # gloss 1 (smooth ice)
         L.new(g.outputs["Color"], mr.inputs["Value"])
-        L.new(mr.outputs["Result"], bsdf.inputs["Roughness"])
+        rough_out = mr.outputs["Result"]
+    if w is not None:
+        rm = N.new("ShaderNodeMix"); rm.data_type = "FLOAT"; rm.location = (x + 500, y - 300)
+        L.new(w, _sock(rm.inputs, "Factor_Float"))
+        if rough_out is not None:
+            L.new(rough_out, _sock(rm.inputs, "A_Float"))
+        else:
+            _sock(rm.inputs, "A_Float").default_value = 0.08
+        _sock(rm.inputs, "B_Float").default_value = 0.7       # snow
+        rough_out = _sock(rm.outputs, "Result_Float")
+    if rough_out is not None:
+        L.new(rough_out, bsdf.inputs["Roughness"])
     else:
         bsdf.inputs["Roughness"].default_value = 0.08
 
     normal_img = _image(cast.texture_path(normal_h), True) if normal_h else None
     if normal_img is not None:
         n = N.new("ShaderNodeTexImage"); n.image = normal_img; n.label = "normal"; n.location = (x, y - 600)
-        _normal_chain(nt, n, bsdf, settings.cast_flip_normal_green, (x + 300, y - 600))
+        n_out = n.outputs["Color"]
+        normal2_img = _image(cast.texture_path(normal2_h), True) if (normal2_h and w is not None) else None
+        if normal2_img is not None:
+            n2 = N.new("ShaderNodeTexImage"); n2.image = normal2_img; n2.label = "normal2"; n2.location = (x, y - 900)
+            nm = _mix_rgba(nt, (x + 150, y - 750), "MIX")
+            L.new(w, _sock(nm.inputs, "Factor_Float"))
+            L.new(n_out, _sock(nm.inputs, "A_Color"))
+            L.new(n2.outputs["Color"], _sock(nm.inputs, "B_Color"))
+            n_out = _sock(nm.outputs, "Result_Color")
+        _normal_chain(nt, n_out, bsdf, settings.cast_flip_normal_green, (x + 300, y - 600))
 
     bsdf.inputs["Metallic"].default_value = 0.0
     _set_input(bsdf, ("IOR",), 1.31)
@@ -897,7 +1099,8 @@ def _normal_chain(nt, img_node, bsdf, flip_green, loc):
     N, L = nt.nodes, nt.links
     x, y = loc
     sep = N.new("ShaderNodeSeparateColor"); sep.location = (x, y)
-    L.new(img_node.outputs["Color"], sep.inputs[0])
+    # an image node, or a colour socket (two blended normal maps)
+    L.new(img_node.outputs["Color"] if hasattr(img_node, "outputs") else img_node, sep.inputs[0])
     g = sep.outputs[1]
     if flip_green:
         inv = N.new("ShaderNodeMath"); inv.operation = "SUBTRACT"; inv.location = (x + 160, y - 60)
@@ -953,11 +1156,33 @@ def detect_flip(cast, sample=4000):
     return score < 0
 
 
+def _alpha_inverted(pos, f, alpha):
+    """Terrain blends ("_b2t", "_bt" decals) store the TERRAIN weight in the vertex alpha: 255 on the open border
+    of the patch (only terrain), lower inside. Used as opacity they ended in hard-edged patches. True when the
+    border vertices are clearly more opaque than the inside ones (measured on World's Edge: border median 255,
+    inside ~150 for volcanic_road_tracks_b2t; normal decals have the opposite)."""
+    if len(alpha) < 16 or len(f) < 4:
+        return False
+    key = np.round(pos.astype(np.float64) * 8).astype(np.int64)
+    uniq, inv = np.unique(key, axis=0, return_inverse=True)
+    inv = inv.ravel()
+    ff = inv[f]
+    e = np.sort(np.concatenate([ff[:, [0, 1]], ff[:, [1, 2]], ff[:, [2, 0]]]), axis=1)
+    eu, cnt = np.unique(e, axis=0, return_counts=True)
+    border = np.zeros(len(uniq), bool)
+    border[eu[cnt == 1].ravel()] = True
+    vb = border[inv]
+    if vb.sum() < 8 or (~vb).sum() < 8:
+        return False
+    b, i = float(np.median(alpha[vb])), float(np.median(alpha[~vb]))
+    return b >= 200 and b >= i + 25
+
+
 def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
     """Merge `meshes` (CastMesh) into one Blender mesh. xf: 3x3 matrix (scale + rotation)."""
-    pos_l, nrm_l, uv_l, col_l, tri_l, mat_l = [], [], [], [], [], []
+    pos_l, nrm_l, uv_l, col_l, tri_l, mat_l, up_l = [], [], [], [], [], [], []
     slots, slot_of = [], {}
-    need_col = False
+    need_col = need_up = False
     base = 0
     off = settings.decal_offset
     for m in meshes:
@@ -977,7 +1202,8 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
                 mat = mat_cache[m.mat] = get_material(cast, m.mat, settings)
             # the material decides whether it reads the vertex colours (tint / decal alpha): then every
             # mesh using it needs the attribute, white when the mesh has none (a missing attribute is black)
-            if is_overlay(mname) or is_vctint(mname) or (mat is not None and mat.get("r5_vctint")):
+            if is_overlay(mname) or is_vctint(mname) or (mat is not None and (mat.get("r5_vctint")
+                                                                               or mat.get("r5_blend"))):
                 need_col = True
         has_n = m.nrm is not None and len(m.nrm) == nv
         pos = m.pos
@@ -989,19 +1215,34 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
         nrm_l.append(m.nrm[f.ravel()] if has_n else np.zeros((f.size, 3), np.float32))
         uv_l.append(m.uv[f.ravel()] if m.uv is not None and len(m.uv) == nv else
                     np.zeros((f.size, 2), np.float32))
+        # blend material: the alpha is the layer weight, 0 (layer 1 only) is a real value
+        blend_m = bool(mat_cache.get(m.mat) is not None and mat_cache[m.mat].get("r5_blend"))
         if m.vc is not None:
             vc = m.vc.view(np.uint8).reshape(-1, 4)
-            if vc[:, 3].max() == 0 or vc[:, :3].max() < 10:
+            fix_a = not blend_m and vc[:, 3].max() == 0
+            if fix_a or vc[:, :3].max() < 10:
                 # Unused data for this mesh (alpha all 0 / black RGB): otherwise the decal becomes
                 # invisible or the tint black in Rendered mode
                 vc = vc.copy()
-                if vc[:, 3].max() == 0:
+                if fix_a:
                     vc[:, 3] = 255
                 if vc[:, :3].max() < 10:
                     vc[:, :3] = 255
+            if is_overlay(mname) and _alpha_inverted(m.pos, f, vc[:, 3]):
+                vc = vc.copy()
+                vc[:, 3] = 255 - vc[:, 3]
+            if blend_m and vc[:, 3].min() == 255:
+                # Prop without vertex colours (the exporter writes white): the layer weight would be 1 everywhere,
+                # i.e. moss-covered rocks (icelandic_rock_cluster_01_moss_01_wld_bm). Flagged: the material puts
+                # layer 2 (moss, snow...) on the faces looking up in the world instead.
+                up_l.append(np.ones(f.size, np.float32))
+                need_up = True
+            else:
+                up_l.append(np.zeros(f.size, np.float32))
             col_l.append(vc[f.ravel()])
         else:
-            col_l.append(np.full((f.size, 4), 255, np.uint8))
+            col_l.append(np.full((f.size, 4), (255, 255, 255, 0) if blend_m else 255, np.uint8))
+            up_l.append(np.zeros(f.size, np.float32))
         tri_l.append(f + base)
         mat_l.append(np.full(len(f), si, np.int32))
         base += nv
@@ -1018,6 +1259,7 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
     luv = np.concatenate(uv_l).astype(np.float32)
     luv[:, 1] = 1.0 - luv[:, 1]
     lcol = np.concatenate(col_l) if need_col else None
+    lup = np.concatenate(up_l) if need_up else None
     fmat = np.concatenate(mat_l)
 
     # Weld vertices (map exports are not indexed)
@@ -1033,6 +1275,8 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
         lnrm, luv = lnrm[keep_loops], luv[keep_loops]
         if lcol is not None:
             lcol = lcol[keep_loops]
+        if lup is not None:
+            lup = lup[keep_loops]
     if len(tris) == 0:
         return None
     used = np.unique(tris)
@@ -1060,6 +1304,9 @@ def build_mesh(name, cast, meshes, xf, settings, flip, mat_cache, origin=None):
             ca.data.foreach_set("color_srgb", cf.ravel())
         except (AttributeError, TypeError):
             ca.data.foreach_set("color", cf.ravel())
+    if lup is not None:
+        ua = me.attributes.new(UP_ATTR, "FLOAT", "CORNER")
+        ua.data.foreach_set("value", lup)
     me.update(calc_edges=True)
 
     if settings.cast_custom_normals and len(me.loops) == nl:

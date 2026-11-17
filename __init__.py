@@ -1,11 +1,11 @@
 bl_info = {
     "name": "Blender R5 Map Loader",
     "author": "Fendesk",
-    "version": (0, 12, 0),
+    "version": (0, 13, 1),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar (N) > R5 Map Loader  |  File > Import",
-    "description": "Loads R5Reloaded / Apex maps (straight from the game, or .mprt, .cast, .ent, .vpk exports) with "
-                   "instancing, switchable dynamic LODs, off-screen unloading, regions / POIs, sky and Cycles setup",
+    "description": "Loads R5Reloaded / Apex map exports (.mprt, .cast, .ent, .vpk, .nut) with instancing, "
+                   "switchable dynamic LODs, off-screen unloading, regions / POIs, sky and Cycles setup",
     "category": "Import-Export",
 }
 
@@ -15,9 +15,8 @@ bl_info = {
 import importlib as _importlib  # noqa: E402
 import sys as _sys  # noqa: E402
 
-for _n in ("placement", "castfile", "castwriter", "bsp", "vpk", "library", "lights", "regions", "gn_instancer",
-           "lod_system", "optimize", "visibility", "sky", "cycles_setup", "properties", "operators", "game_import",
-           "ui"):
+for _n in ("placement", "castfile", "castwriter", "vpk", "library", "lights", "regions", "gn_instancer",
+           "lod_system", "optimize", "visibility", "sky", "cycles_setup", "properties", "operators", "ui"):
     _m = _sys.modules.get(f"{__name__}.{_n}")
     if _m is not None:
         try:
@@ -27,12 +26,11 @@ for _n in ("placement", "castfile", "castwriter", "bsp", "vpk", "library", "ligh
 
 import bpy  # noqa: E402
 
-from . import (placement, castfile, castwriter, bsp, library, lights, regions, gn_instancer,  # noqa: E402
-               lod_system, optimize, visibility, vpk, sky, cycles_setup, properties, operators, game_import, ui)
+from . import (placement, castfile, castwriter, library, lights, regions, gn_instancer,  # noqa: E402
+               lod_system, optimize, visibility, vpk, sky, cycles_setup, properties, operators, ui)
 
 # regions first: its POI type is used by the settings (properties also registers the light type of lights.py).
-_MODULES = (regions, properties, operators, optimize, visibility, sky, cycles_setup, game_import, ui, lights,
-            lod_system)
+_MODULES = (regions, properties, operators, optimize, visibility, sky, cycles_setup, ui, lights, lod_system)
 
 
 def register():
