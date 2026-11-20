@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "r5_map_loader"
+version = "0.15.0"
+name = "Blender R5 Map Loader"
+tagline = "Loads R5Reloaded maps with dynamic LODs, regions and Cycles"
+maintainer = "Fendesk"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Import-Export"]
+
+[permissions]
+files = "Reads map exports"
