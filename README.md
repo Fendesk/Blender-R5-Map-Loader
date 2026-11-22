@@ -12,7 +12,12 @@ The panels are in 3D View > Sidebar (N) > **R5 Map Loader**. The importer is als
 While a map loads, a progress bar shows the current step in Blender's status bar.
 
 ## Load a map
-Export the map with **r5mex** (`r5mex-gui.exe`), then pick the `.mprt` in **Import**:
+Use **r5mex** (coming soon...) or [Legion+](https://github.com/r-ex/LegionPlus) and export the map in `.mprt` format.
+
+> [!WARNING]
+Legion+ is deprecated since the tool is outdated.\
+This can result in missing files and broken map import.
+
 ```
 mp_rr_desertlands_hu/
   mp_rr_desertlands_hu_LOD0.mprt     <- static prop placements (pick this file)
