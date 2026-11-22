@@ -15,7 +15,7 @@ While a map loads, a progress bar shows the current step in Blender's status bar
 Use **r5mex** (coming soon...) or [Legion+](https://github.com/r-ex/LegionPlus) and export the map in `.mprt` format.
 
 > [!WARNING]
-Legion+ is deprecated since the tool is outdated.\
+Using Legion+ is not a good idea since the tool is deprecated.\
 This can result in missing files and broken map import.
 
 ```
