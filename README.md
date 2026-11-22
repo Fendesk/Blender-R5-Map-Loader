@@ -6,7 +6,7 @@ city lights, movers / animated shaders and a Cycles setup.
 
 ## Install
 Blender > Edit > Preferences > Get Extensions > ▾ (top right) > **Install from Disk…** >
-`Blender-R5-Map-Loader-BETA-0.19.5.zip`.
+`Blender-R5-Map-Loader-0.19.5.zip`.
 Uninstall the previous version first, **restart Blender**, then import the map into an empty file.
 The panels are in 3D View > Sidebar (N) > **R5 Map Loader**. The importer is also in File > Import.
 While a map loads, a progress bar shows the current step in Blender's status bar.
