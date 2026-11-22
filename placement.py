@@ -55,6 +55,41 @@ class EntData:
     sky: dict = field(default_factory=dict)            # sky_camera / skybox keys, if present
 
 
+_LONG = "\\\\?\\"
+_LONG_UNC = "\\\\?\\UNC\\"
+
+
+def _prefixed(p):
+    p = os.path.abspath(p)       # the prefix turns off Windows' path normalisation: absolute, backslashes, no ".."
+    return _LONG_UNC + p[2:] if p.startswith("\\\\") else _LONG + p
+
+
+def long_path(path):
+    """Windows: a path of 260 characters or more (MAX_PATH) only opens with the '\\\\?\\' prefix (measured in
+    Blender 4.5 and 5.3, even with LongPathsEnabled: isfile, open and bpy.data.images.load all fail without it).
+    Adds the prefix to long paths and removes it from short ones (the paths found under a prefixed walk_root),
+    so short paths stay the way Blender shows them. Other systems: unchanged."""
+    if os.name != "nt" or not path:
+        return path
+    plain = path
+    if path.startswith(_LONG_UNC):
+        plain = "\\\\" + path[len(_LONG_UNC):]
+    elif path.startswith(_LONG):
+        plain = path[len(_LONG):]
+    if len(plain) < 260:
+        return plain
+    plain = os.path.abspath(plain)       # ("..\" parts make some long paths short)
+    return plain if len(plain) < 260 else _prefixed(plain)
+
+
+def walk_root(path):
+    """Folder to give to os.walk / os.listdir so that files deeper than MAX_PATH are found too (the paths found
+    are prefixed: pass them through long_path)."""
+    if os.name != "nt" or not path or path.startswith(_LONG):
+        return path
+    return _prefixed(path)
+
+
 def model_key(model_path: str) -> str:
     """'mdl/props/foo/Bar_01.rmdl' -> 'bar_01' (lookup key in the library)."""
     base = model_path.replace("\\", "/").rsplit("/", 1)[-1]
@@ -103,6 +138,34 @@ def _iter_entities(text):
                 ent[m.group(1).lower()] = m.group(2)
 
 
+def _zone_of(ent):
+    """Point of interest of an entity (lower-case keys), or None."""
+    if ent.get("zone_name"):
+        return Zone(ent["zone_name"], _vec(ent.get("origin", "0 0 0")),
+                    _float(ent.get("script_radius"), 0.0), "named")
+    if ent.get("editorclass", "") == "info_survival_loot_zone":
+        return Zone(ent.get("zone_class", "loot_zone"), _vec(ent.get("origin", "0 0 0")),
+                    _float(ent.get("script_radius"), 0.0), "loot")
+    return None
+
+
+_BLOCK_RE = re.compile(r"\{([^{}]*)\}")
+_PAIR_RE = re.compile(r'"([^"]*)"\s+"([^"]*)"')
+
+
+def scan_zones(text):
+    """Only the points of interest of an entity file (fast: the other entities are not parsed)."""
+    out = []
+    for b in _BLOCK_RE.finditer(text):
+        blk = b.group(1)
+        if "zone_name" not in blk and "info_survival_loot_zone" not in blk:
+            continue
+        z = _zone_of({k.lower(): v for k, v in _PAIR_RE.findall(blk)})
+        if z:
+            out.append(z)
+    return out
+
+
 def parse_ent_full(text):
     """Read an entity file: props, zipline cables, points of interest, sun and sky info."""
     data = EntData()
@@ -119,13 +182,9 @@ def parse_ent_full(text):
                          for k, v in ent.items() if _ZIP_RE.search(k))
             if len(pts) >= 2:
                 data.ziplines.append([p_ for _i, p_ in pts])
-        ed = ent.get("editorclass", "")
-        if ent.get("zone_name"):
-            data.zones.append(Zone(ent["zone_name"], _vec(ent.get("origin", "0 0 0")),
-                                   _float(ent.get("script_radius"), 0.0), "named"))
-        elif ed == "info_survival_loot_zone":
-            data.zones.append(Zone(ent.get("zone_class", "loot_zone"), _vec(ent.get("origin", "0 0 0")),
-                                   _float(ent.get("script_radius"), 0.0), "loot"))
+        z = _zone_of(ent)
+        if z:
+            data.zones.append(z)
         if cls == "light_environment":
             data.sun = dict(ent)
         if cls in ("sky_camera", "skybox_cam", "env_skybox") or "skyname" in ent:
@@ -140,7 +199,7 @@ def parse_ent_text(text):
 
 
 def parse_ent(path):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(long_path(path), "r", encoding="utf-8", errors="replace") as f:
         return parse_ent_full(f.read()).placements
 
 
@@ -167,7 +226,7 @@ def _from_dict(d):
 
 
 def parse_json(path):
-    with open(path, "r", encoding="utf-8") as f:
+    with open(long_path(path), "r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, dict):
         data = data.get("props") or data.get("entities") or data.get("placements") or []
@@ -182,7 +241,7 @@ def parse_json(path):
 
 def parse_csv(path):
     out = []
-    with open(path, "r", encoding="utf-8", newline="") as f:
+    with open(long_path(path), "r", encoding="utf-8", newline="") as f:
         for row in csv.reader(f):
             if not row or row[0].strip().lower() in ("model", "#") or row[0].startswith("#"):
                 continue
@@ -203,7 +262,7 @@ def parse_mprt(path):
     Entry:  name (C string, no folder or extension), origin xyz,
             rotation (roll, pitch, yaw) in degrees, scale.
     """
-    with open(path, "rb") as f:
+    with open(long_path(path), "rb") as f:
         buf = f.read()
     magic, version, count = struct.unpack_from("<4sII", buf, 0)
     if magic != b"mprt":
@@ -317,7 +376,7 @@ def parse_nut_text(text):
 
 
 def parse_nut(path):
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(long_path(path), "r", encoding="utf-8", errors="replace") as f:
         return parse_nut_text(f.read())
 
 

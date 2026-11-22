@@ -19,6 +19,9 @@ import time
 import bpy
 import numpy as np
 
+from . import progress
+from .placement import long_path, walk_root
+
 # property id -> (numpy dtype, components)
 _PROP = {
     0x62: ("<u1", 1),   # b
@@ -58,7 +61,7 @@ GROUP_KEY = "apx_group"
 GROUPS = (
     ("trigger", "Triggers"),
     ("tool", "Tool brushes (clip, blocklight, skybox...)"),
-    ("fx", "Light shafts & atmosphere volumes"),
+    ("fx", "Light shafts & volumes"),
     ("particle", "Particle / mist cards (vent mist, steam...)"),
     ("gamemode", "Game mode barriers"),
     ("dev", "Dev textures / placeholders"),
@@ -83,17 +86,87 @@ _OVERLAY_RE = re.compile(r"_b2t($|_)|_bt($|_)|transparent|decal|(^|_)dcl|overlay
                          r"stain|drip|splatter|(^|_)cracks?($|_)|(^|_)burn_|sticker|_ovl($|_)")
 _VCTINT_RE = re.compile(r"_vc($|_)|vert_?colou?r|_vcolor|_vt($|_)")
 _FOLIAGE_RE = re.compile(r"leaf|leaves|foliage|grass|fern|bush|shrub|plant|tree|branch|ivy|vine|moss_clump|flower|"
-                         r"weed|bark|needle|pine|palm")
+                         r"weed|bark|needle|pine|palm|lily|lotus|petal|algae|kelp|seaweed|reed|clover")
 _CUTOUT_RE = re.compile(r"(?:^|[_\-\s\d])(?:leaf|leaves|foliage|grass|fern|bush|shrub|plant|tree|branch|ivy|vine|"
                         r"moss_clump|flower|weed|fence|chainlink|chain_link|grate|grating|net|alpha|cutout|hair|"
-                        r"fx|glass)")
+                        r"fx|glass|lily|lilypad|lotus|petal|algae|kelp|seaweed|reed|cattail|clover)")
+
+# Water surfaces. The game draws them with a water shader (depth colour, fog, foam from the depth): their albedo
+# is often an 8x8 white placeholder (district_water_01_depth, canyonlands_river_water_02_depth) or a pale texture
+# tinted by the shader, and the second layer of "<water>_<water foam>_bm" is foam the game shows by depth, not
+# by vertex alpha. Rebuilt as dark, glossy water (see _water_fix).
+_WATER_RE = re.compile(r"water|whirlpool|ocean")
+_WATER_SURFACE_RE = re.compile(r"depth|shallow|murky|pool|whirlpool|river|ocean|hellscape|canal|wild|volatile|lake|pond")
+_NOT_WATER_RE = re.compile(r"underwater|under_water|puddle|stain|tiles|floor|fall|splash|drip|caustic|decal|sign|"
+                           r"ingot|treatment|bottle|tank|tower|_b2t|_bt$|fountain_modern|windswept|landscape")
+_GROUND_RE = re.compile(r"mud|dirt|sand|ground|concrete|rock|grass|soil|gravel|metal|wall|moss")
+WATER_TINT = (0.020, 0.055, 0.060)      # linear: dark blue-green, the colour of deep water in the game
+WATER_LUMA = 0.10                       # water albedos are scaled to this mean brightness
+
+
+# Colour of a surface whose textures exist nowhere (retail terrain layers r5mex did not write, trims of a
+# Flowstate export...), guessed from its name: better than the white of an empty material, which looks like snow.
+_NAME_COLORS = (
+    (r"pink", (0.30, 0.16, 0.19)), (r"blue_green|bluegreen|stasis", (0.06, 0.13, 0.11)),
+    (r"moss|algae", (0.07, 0.11, 0.04)), (r"grass|meadow|clover|lawn|turf", (0.10, 0.14, 0.05)),
+    (r"leaves|leaf|foliage", (0.12, 0.09, 0.04)), (r"flower", (0.16, 0.13, 0.08)),
+    (r"black_?sand|blacksand", (0.05, 0.05, 0.05)), (r"sand", (0.32, 0.28, 0.20)),
+    (r"mud|wet", (0.10, 0.08, 0.05)), (r"dirt|soil|gravel|road|path|track|erosion|quarry", (0.17, 0.14, 0.10)),
+    (r"rock|stone|cliff|crater|moon", (0.24, 0.24, 0.23)), (r"water", WATER_TINT),
+    (r"metal|trim|steel|iron", (0.35, 0.35, 0.36)), (r"concrete|cement", (0.40, 0.39, 0.37)),
+)
+
+
+def is_glass_like(name):
+    return bool(re.search(r"glass|window|glow|holo|screen|light|emissive|neon|_ilm|vfx|fx_", name.lower()))
+
+
+def name_color(name):
+    low = name.lower()
+    for pat, col in _NAME_COLORS:
+        if re.search(pat, low):
+            return col
+    return (0.30, 0.30, 0.30)
+
+
+def is_water_material(name):
+    low = name.lower()
+    if "foam" in low and "depth" not in low:
+        return False            # foam / rapids (canyonlands_river_water_foam_01): light in the game too
+    return bool(_WATER_RE.search(low) and _WATER_SURFACE_RE.search(low) and not _NOT_WATER_RE.search(low))
+
+
+def _water_layers(name):
+    """(layer 1 is water, layer 2 is water) of a blend material name ("a_to_b_bm" or "a_b_bm")."""
+    low = name.lower()
+    if "_to_" in low:
+        a, b = low.split("_to_", 1)
+    elif _GROUND_RE.match(low):
+        return False, True      # "mud_01_divided_wetlands_water_depth_01_bm": ground, then water
+    else:
+        return True, not _GROUND_RE.search(low)
+    return (bool(_WATER_RE.search(a)) and not _GROUND_RE.search(a), bool(_WATER_RE.search(b)) and not _GROUND_RE.search(b))
+
+
+def _image_luma(img):
+    """Mean brightness of an image (sampled), or None."""
+    try:
+        w, h = img.size
+        if not w or not h:
+            return None
+        px = np.empty(w * h * 4, np.float32)
+        img.pixels.foreach_get(px)
+    except (RuntimeError, ValueError):
+        return None
+    rgb = px.reshape(-1, 4)[:: max(1, (w * h) // 20000), :3]
+    return float((rgb @ np.array([0.2126, 0.7152, 0.0722], np.float32)).mean())
 
 # Blend materials ("_bm"): two layers (albedo/albedo2, normal/normal2, gloss/gloss2...)
 _BM_RE = re.compile(r"_bm($|_)")
 # ... which are still real overlays when their name says so
 _BM_OVERLAY_RE = re.compile(r"transparent|decal|_b2t($|_)|_bt($|_)")
 
-MAT_VERSION = 16
+MAT_VERSION = 18
 
 
 def material_group(name):
@@ -141,8 +214,8 @@ def _pool_lookup(start_dir, name):
         d = start_dir
         for _ in range(4):
             cand = os.path.join(d, POOL_DIR)
-            if os.path.isdir(cand):
-                idx = {f.lower(): os.path.join(cand, f) for f in os.listdir(cand)}
+            if os.path.isdir(long_path(cand)):
+                idx = {f.lower(): long_path(os.path.join(cand, f)) for f in os.listdir(walk_root(cand))}
                 break
             parent = os.path.dirname(d)
             if parent == d:
@@ -167,7 +240,7 @@ def _read_file(path, tries=4):
     last = None
     for i in range(tries):
         try:
-            with open(path, "rb") as f:
+            with open(long_path(path), "rb") as f:
                 return f.read()
         except OSError as exc:
             last = exc
@@ -297,15 +370,15 @@ class CastFile:
             return None
         p = p.replace("\\", os.sep).replace("/", os.sep)
         p = p if os.path.isabs(p) else os.path.join(self.dir, p)
-        if os.path.isfile(p):
-            return p
+        if os.path.isfile(long_path(p)):
+            return long_path(p)
         # RSX: the reference may have no extension, or the export may be .dds/.tga
         base = os.path.splitext(p)[0]
         for ext in (".png", ".dds", ".tga", ".PNG", ".DDS"):
-            if os.path.isfile(base + ext):
-                return base + ext
-            if os.path.isfile(p + ext):
-                return p + ext
+            if os.path.isfile(long_path(base + ext)):
+                return long_path(base + ext)
+            if os.path.isfile(long_path(p + ext)):
+                return long_path(p + ext)
         pooled = _pool_lookup(self.dir, os.path.basename(p))
         return pooled or p
 
@@ -354,7 +427,12 @@ def texture_roles(cast, cm, name):
     Returns (roles, unnamed slots [(slot, hash)])."""
     named, unnamed = {}, []
     for slot, h2 in cm.slots.items():
-        role = role_from_filename(cast.texture_path(h2))
+        if isinstance(h2, str) and h2.startswith("lib:"):
+            # texture found by material name (_fill_from_library): the slot name is its role. The file may be
+            # layer 2 of a blend material ("..._to_<this material>_bm_albedo2Texture.png") used as layer 1 here
+            role = role_from_filename(f"lib_{slot}.png")
+        else:
+            role = role_from_filename(cast.texture_path(h2))
         if role is None:
             unnamed.append((slot, h2))
         else:
@@ -411,7 +489,7 @@ def _looks_emissive(name):
 
 def _png_has_alpha(path):
     try:
-        with open(path, "rb") as f:
+        with open(long_path(path), "rb") as f:
             head = f.read(33)
         if head[:8] != b"\x89PNG\r\n\x1a\n":
             return True   # dds/tga: assume there may be alpha
@@ -457,7 +535,7 @@ def material_textures(name):
     if idx is None:
         idx = {}
         for d in _tex_libs:
-            for root, _dirs, files in os.walk(d):
+            for root, _dirs, files in os.walk(walk_root(d)):
                 for f in files:
                     low = f.lower()
                     if not low.endswith(_TEX_EXT):
@@ -466,9 +544,29 @@ def material_textures(name):
                     cut = stem.rfind("_")
                     if cut <= 0 or not stem[cut + 1:].lower().endswith("texture"):
                         continue
-                    idx.setdefault(stem[:cut].lower(), {}).setdefault(stem[cut + 1:], os.path.join(root, f))
+                    idx.setdefault(stem[:cut].lower(), {}).setdefault(stem[cut + 1:], long_path(os.path.join(root, f)))
+        # Layers of the blend materials "<a>_to_<b>_bm": albedo/normal/gloss/spec = material a, albedo2/normal2...
+        # = material b. Retail terrain layers (Broken Moon: divided_cracked_moon_sand_01, the grasses...) are
+        # written without their own texture files, but every transition between two layers holds both.
+        derived = {}
+        for mat, slots in idx.items():
+            m = _BM_PAIR_RE.match(mat)
+            if not m:
+                continue
+            for slot, path in slots.items():
+                base = slot[:-len("texture")]
+                if base.endswith("2"):
+                    derived.setdefault(m.group(2), {}).setdefault(base[:-1] + slot[-7:], path)
+                else:
+                    derived.setdefault(m.group(1), {}).setdefault(slot, path)
+        for mat, slots in derived.items():
+            if mat not in idx:
+                idx[mat] = slots
         _tex_index["idx"] = idx
-    return idx.get(name.lower(), {})
+    return idx.get(name.lower().rsplit("/", 1)[-1], {})
+
+
+_BM_PAIR_RE = re.compile(r"^(.+?)_to_(.+)_bm$")
 
 
 def _fill_from_library(cast, cm, name):
@@ -478,7 +576,7 @@ def _fill_from_library(cast, cm, name):
         return
     for h2 in cm.slots.values():
         p = cast.texture_path(h2)
-        if p and os.path.isfile(p):
+        if p and os.path.isfile(long_path(p)):
             return
     lib = material_textures(name)
     if not lib:
@@ -495,7 +593,7 @@ def _exists(path, tries=3):
     if path in _img_missing:
         return False
     for i in range(tries):
-        if os.path.isfile(path):
+        if os.path.isfile(long_path(path)):
             return True
         time.sleep(0.2 * (i + 1))
     _img_missing.add(path)
@@ -506,7 +604,7 @@ def _exists(path, tries=3):
 def _load_image(path, tries=3):
     for i in range(tries):
         try:
-            return bpy.data.images.load(path, check_existing=True)
+            return bpy.data.images.load(long_path(path), check_existing=True)
         except RuntimeError:
             time.sleep(0.3 * (i + 1))
     print(f"[R5] could not read texture: {path}")
@@ -518,7 +616,7 @@ def _image(path, non_color):
     if not path or not _exists(path):
         return None
     try:
-        key = f"{os.path.basename(path).lower()}|{os.path.getsize(path)}"
+        key = f"{os.path.basename(path).lower()}|{os.path.getsize(long_path(path))}"
     except OSError:
         return None
     img = _img_cache.get(key)
@@ -847,7 +945,7 @@ def get_material(cast, h, settings):
         mat = bpy.data.materials.new(name)
     elif mat.use_nodes and mat.node_tree:
         _reset_tree(mat)      # material from an older add-on version: rebuilt in place
-        for k in ("r5_additive", "r5_vfx", "r5_energy", "r5_anim", "r5_lodfade", "r5_glow", "r5_vctint"):
+        for k in ("r5_additive", "r5_vfx", "r5_energy", "r5_anim", "r5_lodfade", "r5_glow", "r5_vctint", "r5_water", "r5_name_color"):
             if k in mat:
                 del mat[k]
     mat["apx_cast"] = MAT_VERSION
@@ -892,7 +990,7 @@ def get_material(cast, h, settings):
         # Decals keep their opacity in a separate grey-scale texture (opacityMultiply). With hashed file
         # names, look for it in the extra slots.
         for slot, h2 in unnamed:
-            # Legion+ positional names, or RSXreloaded's unnamed "slot<n>"
+            # Legion+ positional names, or r5mex's unnamed "slot<n>"
             if slot.lower() in ("emissive", "ao", "cavity") or re.fullmatch(r"slot\d+", slot.lower()):
                 img = _image(cast.texture_path(h2), True)
                 if img is not None and _mask_like(img):
@@ -917,6 +1015,12 @@ def get_material(cast, h, settings):
         nt.nodes.active = alb       # Solid > Texture shading shows the active image node
     elif "albedo" in roles:
         mat["apx_cast"] = 0         # texture unreadable right now (drive?): rebuilt on the next import
+    elif not overlay and group is None and not is_glass_like(name):
+        # no albedo anywhere (not in the export, not in the other exports): a colour from the name, not white
+        col = name_color(name)
+        bsdf.inputs["Base Color"].default_value = (*col, 1.0)
+        mat.diffuse_color = (*col, 1.0)
+        mat["r5_name_color"] = True
     # Blend materials (walls, ground): the last exported slot is not always the specular of layer 1
     # (bright masks -> white chrome); they are never metals anyway.
     blend = "albedo2" in roles or is_blend_material(name)
@@ -932,6 +1036,15 @@ def get_material(cast, h, settings):
     # materials meet, alpha is 0 when they share layer 1 and 255 when they share layer 2). Without it the
     # ground showed hard borders between meshes.
     alb2 = tex("albedo2", False)[0] if blend and alb is not None and not overlay else None
+    water = is_water_material(name) and group is None and alb is not None
+    w1 = w2 = False
+    if water:
+        w1, w2 = _water_layers(name) if alb2 is not None else (True, False)
+        if alb2 is not None and w1 and w2:
+            alb2 = None             # "<water>_<water foam>_bm": the game draws the foam by depth, not vertex alpha
+        vctint = False
+        mat["r5_vctint"] = False
+        mat["r5_water"] = True
     mat["r5_blend"] = alb2 is not None
     col_attr = None
     if overlay or vctint or alb2 is not None:
@@ -947,10 +1060,29 @@ def get_material(cast, h, settings):
         links.new(b_out, _sock(m.inputs, "B_Color"))
         return _sock(m.outputs, "Result_Color")
 
-    spec = None if blend else tex("specular", False)[0]
+    spec = None if blend or water else tex("specular", False)[0]
+
+    def water_col(node, loc):
+        """Water layer colour: the deep-water tint for a placeholder albedo, else the texture darkened to the
+        brightness of water (pale textures are tinted by the game's water shader)."""
+        img = node.image
+        if max(img.size) <= 16:
+            rgb = nt.nodes.new("ShaderNodeRGB"); rgb.location = loc
+            rgb.outputs[0].default_value = (*WATER_TINT, 1.0)
+            return rgb.outputs[0]
+        f = min(1.0, WATER_LUMA / max(_image_luma(img) or WATER_LUMA, 1e-3))
+        m = _mix_rgba(nt, loc, "MULTIPLY")
+        _sock(m.inputs, "Factor_Float").default_value = 1.0
+        links.new(node.outputs["Color"], _sock(m.inputs, "A_Color"))
+        _sock(m.inputs, "B_Color").default_value = (f, f, f, 1.0)
+        return _sock(m.outputs, "Result_Color")
+
     base_out = alb.outputs["Color"] if alb else None
+    if base_out is not None and water and w1:
+        base_out = water_col(alb, (x + 150, y + 750))
     if alb2 is not None:
-        base_out = layered(base_out, alb2.outputs["Color"], (x + 300, y + 600))
+        b2 = water_col(alb2, (x + 150, y + 900)) if water and w2 else alb2.outputs["Color"]
+        base_out = layered(base_out, b2, (x + 300, y + 600))
     if base_out is not None and vctint and col_attr is not None:
         mul = _mix_rgba(nt, (x + 300, y + 450), "MULTIPLY")
         _sock(mul.inputs, "Factor_Float").default_value = 1.0
@@ -1037,6 +1169,12 @@ def get_material(cast, h, settings):
         rough, _ = tex("roughness", True)
         if rough:
             links.new(rough.outputs["Color"], bsdf.inputs["Roughness"])
+    if water and w1 and (alb2 is None or w2):
+        # still water: a glossy surface (the gloss maps of the water shaders are flat and pale). Not a perfect
+        # mirror: at grazing angles it would reflect the bright sky / studio light as white water
+        for lk in list(bsdf.inputs["Roughness"].links):
+            links.remove(lk)
+        bsdf.inputs["Roughness"].default_value = 0.1
 
     em, _ = tex("emissive", False)
     if em:
@@ -1549,8 +1687,42 @@ def world_z_samples(cast, xf, brush_origins=None):
     return np.concatenate(out) if out else np.zeros(0, np.float32)
 
 
+def crop_meshes(cast, area):
+    """Keep only the geometry inside a vertical cylinder: area = (x, y, radius), game units. A triangle is kept
+    when one of its vertices is inside, so the edge of the area is not cut through the triangles."""
+    cx, cy, r = area
+    r2 = float(r) * float(r)
+    keep = []
+    for m in cast.meshes:
+        nv = len(m.pos)
+        f = m.faces[: (len(m.faces) // 3) * 3].reshape(-1, 3)
+        if len(f) == 0 or f.max() >= nv:
+            continue
+        p = m.pos.astype(np.float64)
+        inside = (p[:, 0] - cx) ** 2 + (p[:, 1] - cy) ** 2 <= r2
+        if inside.all():
+            keep.append(m)
+            continue
+        tri = inside[f].any(axis=1)
+        if not tri.any():
+            continue
+        f = f[tri]
+        used = np.unique(f)
+        remap = np.full(nv, -1, dtype=np.int64)
+        remap[used] = np.arange(len(used))
+        m.faces = remap[f].ravel()
+        m.pos = m.pos[used]
+        for attr in ("nrm", "uv", "vc"):
+            a = getattr(m, attr)
+            if a is not None and len(a) == nv:
+                setattr(m, attr, a[used])
+        keep.append(m)
+    cast.meshes = keep
+    return len(keep)
+
+
 def import_world_cast(path, settings, collection, xf, offset, report=print, cast=None, brush_origins=None,
-                      separate=None):
+                      separate=None, area=None):
     """Import a map's geometry, optionally split into square tiles.
 
     xf: 3x3 (game units -> Blender), offset: shift in meters removed after the transform.
@@ -1558,16 +1730,20 @@ def import_world_cast(path, settings, collection, xf, offset, report=print, cast
     cast: an already read CastFile of `path` (optional). brush_origins: {N: origin} of the brush entities.
     separate: brush models N that get their own object (moved by a rotator, see motion.py), tagged
     "apx_rotor_brush".
+    area: (x, y, radius) in game units: only the geometry of that area is imported (see crop_meshes).
     """
     if cast is None:
         cast = CastFile(path)
         place_brush_models(cast, brush_origins)
-    flip = detect_flip(cast)
+    flip = detect_flip(cast)          # (on the whole map: a small area may hold too few faces to tell)
+    if area is not None:
+        crop_meshes(cast, area)
     split = settings.world_split
     tile = settings.world_tile_size if split == "TILES" else 0.0
     groups = {}
     separate = set(separate or ())
     for m in cast.meshes:
+        progress.keep_alive()
         g = material_group(cast.mat_name(m.mat))
         bm = _BRUSH_MESH_RE.match(m.name)
         if bm and int(bm.group(1)) in separate and not g:
@@ -1588,6 +1764,7 @@ def import_world_cast(path, settings, collection, xf, offset, report=print, cast
     wm.progress_begin(0, len(groups))
     for i, ((g, key), ms) in enumerate(sorted(groups.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))):
         wm.progress_update(i)
+        progress.update(i / max(len(groups), 1))
         rotor = key[0] == "brush"
         center = np.array([(key[0] + 0.5) * tile, (key[1] + 0.5) * tile, 0.0]) if tile > 0 and not rotor \
             else np.zeros(3)

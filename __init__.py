@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Blender R5 Map Loader",
     "author": "Fendesk",
-    "version": (0, 15, 0),
+    "version": (0, 19, 4),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar (N) > R5 Map Loader  |  File > Import",
     "description": "Loads R5Reloaded / Apex map exports (.mprt, .cast, .ent, .vpk, .nut) with instancing, "
@@ -15,8 +15,8 @@ bl_info = {
 import importlib as _importlib  # noqa: E402
 import sys as _sys  # noqa: E402
 
-for _n in ("placement", "castfile", "castwriter", "vpk", "library", "lights", "regions", "gn_instancer",
-           "lod_system", "motion", "optimize", "visibility", "sky", "cycles_setup", "properties", "operators", "ui"):
+for _n in ("progress", "placement", "castfile", "castwriter", "vpk", "library", "lights", "regions", "gn_instancer",
+           "lod_system", "motion", "optimize", "visibility", "sky", "cycles_setup", "camera", "properties", "operators", "ui", "exwin"):
     _m = _sys.modules.get(f"{__name__}.{_n}")
     if _m is not None:
         try:
@@ -27,10 +27,21 @@ for _n in ("placement", "castfile", "castwriter", "vpk", "library", "lights", "r
 import bpy  # noqa: E402
 
 from . import (placement, castfile, castwriter, library, lights, regions, gn_instancer,  # noqa: E402
-               lod_system, motion, optimize, visibility, vpk, sky, cycles_setup, properties, operators, ui)
+               lod_system, motion, optimize, visibility, vpk, sky, cycles_setup, camera, progress, properties, operators, ui)
+
+# EX build only: the interface in a separate window (exwin.py is left out of the regular zip)
+import importlib.util as _ilu  # noqa: E402
+
+if _ilu.find_spec(f"{__name__}.exwin") is not None:
+    from . import exwin  # noqa: E402
+else:
+    exwin = None
 
 # regions first: its POI type is used by the settings (properties also registers the light type of lights.py).
-_MODULES = (regions, properties, operators, motion, optimize, visibility, sky, cycles_setup, ui, lights, lod_system)
+_MODULES = (regions, properties, operators, motion, optimize, visibility, sky, cycles_setup, camera, progress, ui, lights,
+            lod_system)
+if exwin is not None:
+    _MODULES += (exwin,)
 
 
 def register():

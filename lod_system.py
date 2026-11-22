@@ -131,6 +131,71 @@ def invalidate():
     _cache.valid = False
     _cache.last_view = None
     _cache.forced_applied = None
+    hidden_dirty()
+
+
+# --------------------------------------------------------------------------
+# How many props the LODs / culling currently hide (LOD & streaming panel)
+# --------------------------------------------------------------------------
+HIDDEN = {"total": 0, "drawn": 0, "valid": False, "dirty": True, "at": 0.0}
+
+
+def hidden_dirty():
+    HIDDEN["dirty"] = True
+    HIDDEN["at"] = time.monotonic()
+
+
+def _gn_drawn(ev):
+    """Instances made by an evaluated Geometry Nodes instancer, or None (Blender < 4.3)."""
+    get = getattr(ev, "evaluated_geometry", None)
+    if get is None:
+        return None
+    try:
+        geo = get()                 # (kept alive: the point cloud belongs to it)
+        pc = geo.instances_pointcloud()
+        return len(pc.points) if pc is not None else 0
+    except (ReferenceError, RuntimeError, AttributeError):
+        return None
+
+
+def count_hidden(scene):
+    """Props placed vs props drawn now (sky props excluded). Geometry Nodes: instances of each instancer;
+    Empties: empties showing a collection. A prop drawn in two LODs (cross-fade) counts once."""
+    from . import gn_instancer
+    dg = bpy.context.evaluated_depsgraph_get()
+    total = drawn = 0
+    slow = []
+    for o in gn_instancer.instancer_objects(scene):
+        if o.get("apx_sky"):
+            continue
+        n = len(o.data.vertices)
+        total += n
+        k = _gn_drawn(o.evaluated_get(dg))
+        if k is None:
+            slow.append(o)
+        else:
+            drawn += min(k, n)
+    if slow:           # Blender 4.2: count the instances of the depsgraph
+        per = {o.name: 0 for o in slow}
+        for di in dg.object_instances:
+            if di.is_instance and di.parent is not None:
+                nm = di.parent.original.name
+                if nm in per:
+                    per[nm] += 1
+        drawn += sum(min(per[o.name], len(o.data.vertices)) for o in slow)
+    for o in scene.objects:
+        if o.type == "EMPTY" and "apx_model" in o:
+            total += 1
+            if o.instance_type == "COLLECTION" and o.instance_collection is not None and not o.hide_viewport:
+                drawn += 1
+    HIDDEN.update(total=total, drawn=drawn, valid=True, dirty=False)
+    for win in bpy.context.window_manager.windows:
+        for area in win.screen.areas:
+            if area.type == "VIEW_3D":
+                for r in area.regions:
+                    if r.type == "UI":
+                        r.tag_redraw()
+    return total - drawn
 
 
 def rebuild(scene):
@@ -195,7 +260,10 @@ def _compute_levels(scene, view, s):
     if s.use_culling:
         culled |= raw >= s.cull_distance
     if s.cull_small_props and view.mode > 0.25 and s.min_screen_pct > 0:
-        culled |= c.size / np.maximum(raw * view.tany, 1e-4) < s.min_screen_pct / 100.0
+        small = c.size / np.maximum(raw * view.tany, 1e-4) < s.min_screen_pct / 100.0
+        if s.cull_keep_radius > 0:
+            small &= c.size < s.cull_keep_radius        # (c.size = model radius x prop scale)
+        culled |= small
     if s.use_frustum and view.mode > 0.75:
         rmat = np.array(view.quat.to_matrix(), dtype=np.float32)    # columns = view axes
         vl = rel @ rmat                                              # view-space coordinates
@@ -281,6 +349,7 @@ def _gn_present():
 
 def apply_view(scene, view):
     from . import gn_instancer
+    hidden_dirty()
     n = update_empties(scene, view)
     if _gn_present():
         gn_instancer.set_probe(scene, view.eye, view.quat, view.tanx, view.tany, view.mode)
@@ -321,6 +390,48 @@ _render_started = 0.0
 TICK = 0.1
 
 
+def _empties_present(scene):
+    return any(o.type == "EMPTY" and "apx_model" in o for o in scene.objects)
+
+
+_render_sig = [None]
+
+
+def _camera_signature(scene):
+    """What the final render values depend on besides the settings (see gn_instancer.render_values)."""
+    cam, r = scene.camera, scene.render
+    d = cam.data if cam is not None and cam.type == "CAMERA" else None
+    return (cam.name if cam else None, d.type if d else None, d.lens if d else 0, d.sensor_width if d else 0,
+            d.sensor_height if d else 0, d.sensor_fit if d else None, r.resolution_x, r.resolution_y,
+            r.pixel_aspect_x, r.pixel_aspect_y)
+
+
+def _map_loaded(scene):
+    return _gn_present() or scene.get("apx_offset") is not None or any(
+        c.name.startswith("APX_Map_") for c in scene.collection.children)
+
+
+def ensure_render_lock(scene):
+    """Render > Lock Interface on. The render handlers below change the props (Geometry Nodes inputs, empties)
+    from the render thread before every frame of an animation; if the 3D views redraw at the same time, Blender
+    crashes in its draw code (EXCEPTION_ACCESS_VIOLATION in GPU_batch_draw_parameter_get / workbench). Lock
+    Interface stops the interface from redrawing the scene while a render runs. It is read when the render
+    starts, so it is set as soon as a map is in the file. Returns True when it was switched on."""
+    r = scene.render
+    if r.use_lock_interface:
+        return False
+    r.use_lock_interface = True
+    print("[R5] Render > Lock Interface switched on (needed for animation renders of the map)")
+    return True
+
+
+def _render_job():
+    try:
+        return bpy.app.is_job_running("RENDER")
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
 def _render_running():
     try:
         return bpy.app.is_job_running("RENDER")
@@ -334,6 +445,10 @@ def _timer():
     if scene is None or not hasattr(scene, "r5_settings"):
         return 1.0
     s = scene.r5_settings
+    if not _rendering and _render_job():
+        # a render started and render_pre has not run yet: the render thread is copying the scene, nothing may
+        # change now (changing the props here crashed Blender 5.3 at the start of animation renders)
+        return 0.5
     if _rendering:
         # render_post / render_cancel are not always called (crashed or aborted render, add-ons rendering
         # in their own way): never leave the LODs frozen because of a render that is no longer running.
@@ -342,6 +457,28 @@ def _timer():
         _rendering = False
         _state.applied = None
         _cache.last_view = None
+    try:
+        if not scene.render.use_lock_interface and _map_loaded(scene):
+            ensure_render_lock(scene)       # (files saved by older versions, or switched off by hand)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[R5] lock interface: {exc}")
+    try:
+        # camera, lens or resolution changed: refresh the final render values of the modifiers (main thread)
+        sig = _camera_signature(scene)
+        if sig != _render_sig[0]:
+            _render_sig[0] = sig
+            if _gn_present():
+                from . import gn_instancer
+                gn_instancer.apply_settings(scene)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[R5] render values: {exc}")
+    now = time.monotonic()
+    if HIDDEN["dirty"] and now - HIDDEN["at"] > 0.5 and now - _state.changed_at > 0.5:
+        try:
+            count_hidden(scene)         # (panel: "N props hidden"), once the view and the LODs settled
+        except Exception as exc:  # noqa: BLE001
+            HIDDEN["dirty"] = False
+            print(f"[R5] hidden props count: {exc}")
     try:
         if not s.use_lod:
             if _cache.forced_applied != s.forced_lod:
@@ -397,25 +534,18 @@ def _render_pre(scene, _dg=None):
     global _rendering, _render_started
     _rendering = True
     _render_started = time.monotonic()
+    # Geometry Nodes instancing: nothing to do. The modifiers already hold the final render values ("R ..."
+    # inputs, written from the main thread by gn_instancer.apply_settings) and read the active camera
+    # themselves on every frame. Changing them here, from the render thread, crashed animation renders.
+    # Empties mode (small areas only) still switches its empties here.
+    if not _empties_present(scene):
+        return
     s = scene.r5_settings
-    from . import gn_instancer
-    gn = _gn_present()
     try:
         if not s.use_lod or s.render_mode == "LOD0":
-            level = s.forced_lod if not s.use_lod else 0
-            apply_forced(scene, level)
-            if gn:
-                gn_instancer.apply_settings(scene, force_level=level)
+            apply_forced(scene, s.forced_lod if not s.use_lod else 0)
         elif s.render_mode == "CAMERA" and scene.camera is not None:
-            v = camera_view(scene, frustum=s.render_frustum)
-            update_empties(scene, v)
-            if gn:
-                # smooth LOD transitions: every frame of an animation is rendered with the props drawn in both
-                # LODs inside the cross-fade band (see gn_instancer "Fade Width" and motion.lod_fade)
-                from . import motion
-                fade = s.lod_fade_width if (s.lod_fade and motion.lod_fade_ready()) else 0.0
-                gn_instancer.apply_settings(scene, min_screen=s.render_min_screen_pct / 100.0, fade=fade)
-                gn_instancer.set_probe(scene, v.eye, v.quat, v.tanx, v.tany, v.mode)
+            update_empties(scene, camera_view(scene, frustum=s.render_frustum))
     except Exception as exc:  # noqa: BLE001
         print(f"[R5] render_pre: {exc}")
 
@@ -426,13 +556,7 @@ def _render_post(scene, _dg=None):
     _rendering = False
     _cache.last_view = None
     _cache.forced_applied = None
-    _state.applied = None
-    try:
-        if _gn_present():
-            from . import gn_instancer
-            gn_instancer.apply_settings(scene)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[R5] render_post: {exc}")
+    _state.applied = None           # the timer re-applies the viewport state (main thread)
 
 
 _HANDLERS = (
@@ -440,12 +564,20 @@ _HANDLERS = (
     ("undo_post", _on_undo),
     ("redo_post", _on_undo),
     ("render_pre", _render_pre),
-    ("render_post", _render_post),
+    # once at the end, not after every frame: in an animation, render_post runs between two frames and would
+    # put the viewport settings back only for render_pre to change them again (from the render thread)
+    ("render_complete", _render_post),
     ("render_cancel", _render_post),
 )
 
 
 def register():
+    # handlers left by an older version of the add-on (render_post before 0.16.1)
+    for name in ("render_post", "render_pre", "render_complete", "render_cancel"):
+        lst = getattr(bpy.app.handlers, name)
+        for fn in list(lst):
+            if getattr(fn, "__module__", "").endswith("r5_map_loader.lod_system") and (name, fn) not in _HANDLERS:
+                lst.remove(fn)
     for name, fn in _HANDLERS:
         lst = getattr(bpy.app.handlers, name)
         if fn not in lst:

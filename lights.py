@@ -616,8 +616,17 @@ class R5_PT_lights(bpy.types.Panel):
     bl_category = "R5 Map Loader"
     bl_label = "City lights"
     bl_idname = "R5_PT_lights"
-    bl_order = 4                 # below Sky (ui.py)
+    bl_order = 5                 # below Sky, above Animation (ui.py)
     bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        from .ui import SIDEBAR
+        from . import progress
+        return SIDEBAR[0] and not progress.active()
+
+    def draw_header(self, context):
+        self.layout.label(icon="LIGHT")
 
     def draw(self, context):
         s = context.scene.r5_settings

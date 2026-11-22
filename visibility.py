@@ -84,9 +84,11 @@ class R5_UL_models(bpy.types.UIList):
     """List of the prop models (one instancer object per model in Geometry Nodes mode)."""
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        row = layout.row(align=True)
         n = len(item.data.vertices) if item.type == "MESH" else 0
-        row.label(text=item.get("apx_gn", item.name), icon="OUTLINER_OB_POINTCLOUD")
+        split = layout.split(factor=0.66, align=True)
+        split.label(text=item.get("apx_gn", item.name))
+        row = split.row(align=True)
+        row.alignment = "RIGHT"
         row.label(text=str(n))
         row.prop(item, "hide_viewport", text="", emboss=False)
         row.prop(item, "hide_render", text="", emboss=False)
