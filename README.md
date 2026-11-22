@@ -23,9 +23,9 @@ mp_rr_desertlands_hu/
   mp_rr_desertlands_hu_LOD0.mprt     <- static prop placements (pick this file)
   mp_rr_desertlands_hu_LOD0.cast     <- map geometry (loaded automatically)
   mp_rr_desertlands_hu_skybox.mprt   <- 3D skybox (loaded automatically)
-  _images/                            <- geometry textures
+  _images/                           <- geometry textures
   _models/<model>/<model>_LOD0.cast
-  entities/                           <- doors, loot bins, ziplines, POIs, rotators, lights
+  entities/                          <- doors, loot bins, ziplines, POIs, rotators, lights
 ```
 - **Replace the loaded map**: the button under *Import* (or the option in the file browser) removes the map
   already in the file before importing the new one. Sky and render settings are kept; Ctrl+Z brings it back.
