@@ -751,6 +751,39 @@ def make_additive(mat, strength=1.0):
     mat["r5_additive"] = True
 
 
+def make_unlit(mat):
+    """Sky dome materials (sky, stars, far ground of the 3D skybox): drawn without lighting in game. The base
+    colour becomes an emission (its alpha kept), so the sky shows its own colours, whatever the lights."""
+    if mat is None or not mat.use_nodes or mat.get("r5_unlit"):
+        return False
+    nt = mat.node_tree
+    N, L = nt.nodes, nt.links
+    outs = [n for n in N if n.type == "OUTPUT_MATERIAL"]
+    out = next((n for n in outs if n.is_active_output), outs[0] if outs else None)
+    bsdf = next((n for n in N if n.type == "BSDF_PRINCIPLED"), None)
+    if out is None or bsdf is None:
+        return False
+    em = N.new("ShaderNodeEmission"); em.name = "R5_Unlit"; em.location = (bsdf.location.x, bsdf.location.y + 250)
+    base = bsdf.inputs["Base Color"]
+    if base.links:
+        L.new(base.links[0].from_socket, em.inputs["Color"])
+    else:
+        em.inputs["Color"].default_value = base.default_value
+    shader = em.outputs[0]
+    alpha = bsdf.inputs["Alpha"]
+    if alpha.links:
+        tr = N.new("ShaderNodeBsdfTransparent"); tr.location = (em.location.x, em.location.y + 150)
+        mix = N.new("ShaderNodeMixShader"); mix.name = "R5_Unlit_Alpha"; mix.location = (em.location.x + 200, em.location.y)
+        L.new(alpha.links[0].from_socket, mix.inputs[0])
+        L.new(tr.outputs[0], mix.inputs[1])
+        L.new(em.outputs[0], mix.inputs[2])
+        shader = mix.outputs[0]
+    L.new(shader, out.inputs["Surface"])
+    mat.use_backface_culling = False           # seen from inside
+    mat["r5_unlit"] = True
+    return True
+
+
 def is_vfx_model(key):
     """Effect shells drawn by a VFX shader in game (vfx_moon_mu1_z07_dome: the energy dome of Broken Moon,
     a/b/c_olympus_energy_dome_03: the energy dome of Olympus)."""

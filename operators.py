@@ -658,7 +658,9 @@ def _import_map(context, paths, report, poi, poi_scale):
             n_sky += len(items)
             far = max(float(np.linalg.norm(np.array(it[0][:]))) + library.model_radius(key) * it[2] for it in items)
             o["apx_sky_far"] = far
-        report(f"Skybox: {n_sky} vista props ({os.path.basename(sky_paths[0])})")
+        n_dome = _skybox_backdrop(groups, available, {placement.model_key(p.model) for p in placements}, offset)
+        report(f"Skybox: {n_sky} vista props ({os.path.basename(sky_paths[0])})"
+               f"{f', {n_dome} sky dome(s) drawn unlit' if n_dome else ''}")
 
     if ziplines and s.import_ziplines:
         map_name = _map_name(place_paths[0]) if place_paths else "map"
@@ -715,6 +717,59 @@ def _import_map(context, paths, report, poi, poi_scale):
         report(f"WARNING: {created} separate objects make the viewport very slow (~1 fps). Use Geometry Nodes "
                f"instancing for a full map, or 'Import an area only' for this mode")
     return created, len(available), missing
+
+
+_RAY_FLAGS = ("visible_shadow", "visible_diffuse", "visible_glossy", "visible_transmission",
+              "visible_volume_scatter")
+
+
+def _skybox_backdrop(groups, available, map_keys, offset):
+    """The game draws the 3D skybox behind the map, as a backdrop: it casts no shadow and blocks no light.
+    Its sky dome (olympus_mu2_se: 30 km wide, 13 km high) encloses the whole map: as a plain mesh it would
+    shade the map from the sun and from the world's light (black map in Cycles, dark in EEVEE).
+    - Every skybox model is seen by the camera only (no shadow, not seen by light rays). EEVEE reads these
+      flags on the objects of the instanced model, Cycles on the instancer: both are set. A model also placed
+      on the map keeps its flags there.
+    - The models enclosing the map (the domes) show their textures unlit, as in game (sky, stars, far ground),
+      except the materials shared with other models (lit scenery).
+    Returns the number of domes."""
+    origin = Vector((-offset.x, -offset.y, -offset.z))   # the sky_camera: game origin of the skybox
+    domes, others = [], []
+    for key, items in groups.items():
+        b = library.model_bounds(key)
+        enclosing = False
+        if b is not None:
+            corners = [Vector((x, y, z)) for x in (b[0][0], b[1][0]) for y in (b[0][1], b[1][1])
+                       for z in (b[0][2], b[1][2])]
+            for loc, rot, scale in items:
+                pts = [Vector(loc) + (Euler(rot, "XYZ").to_matrix() @ (c * scale)) for c in corners]
+                lo = [min(p[i] for p in pts) for i in range(3)]
+                hi = [max(p[i] for p in pts) for i in range(3)]
+                if all(lo[i] < origin[i] < hi[i] for i in range(3)):
+                    enclosing = True
+                    break
+        (domes if enclosing else others).append(key)
+        if key not in map_keys:
+            for c in available[key][:1]:
+                for o in c.all_objects:
+                    for f in _RAY_FLAGS:
+                        setattr(o, f, False)
+    for o in bpy.data.objects:
+        if o.get("apx_sky") and o.get("apx_gn") in groups:
+            for f in _RAY_FLAGS:
+                setattr(o, f, False)
+
+    def materials(keys):
+        out = set()
+        for k in keys:
+            for c in available[k][:1]:
+                for o in c.all_objects:
+                    out.update(s.material for s in getattr(o, "material_slots", ()) if s.material)
+        return out
+    lit = materials(others) | materials(map_keys & set(available))
+    for mat in materials(domes) - lit:
+        castfile.make_unlit(mat)
+    return len(domes)
 
 
 def fit_clip_to_sky(context, scene):
