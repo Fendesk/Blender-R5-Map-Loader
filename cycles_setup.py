@@ -65,6 +65,8 @@ def setup_cycles(context, preset):
         c.texture_limit_render = s.cycles_texture_limit
         c.texture_limit = s.cycles_texture_limit
     r.use_persistent_data = True
+    from . import lod_system
+    lod_system.ensure_render_lock(scene)     # the props change before every frame (see lod_system)
     c.use_auto_tile = True
     c.tile_size = 2048
 

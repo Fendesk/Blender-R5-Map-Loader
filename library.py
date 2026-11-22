@@ -16,6 +16,7 @@ import numpy as np
 from mathutils import Matrix
 
 from .castfile import GROUP_KEY, is_fx_model, is_vfx_model, make_vfx
+from .placement import long_path, walk_root
 
 SUPPORTED_EXT = (".cast", ".glb", ".gltf", ".fbx", ".obj", ".semodel", ".smd")
 LIB_COLLECTION = "APX_Library"
@@ -33,13 +34,13 @@ def build_index(root):
     if ";" in root:
         merged = {}
         for r in (p.strip() for p in root.split(";")):
-            if r and os.path.isdir(r):
+            if r and os.path.isdir(long_path(r)):
                 for k, v in build_index(r).items():
                     merged.setdefault(k, v)
         return merged
     index = {}
     prio = {e: i for i, e in enumerate(SUPPORTED_EXT)}
-    for dirpath, _dirs, files in os.walk(root):
+    for dirpath, _dirs, files in os.walk(walk_root(root)):
         for fn in files:
             stem, ext = os.path.splitext(fn)
             ext = ext.lower()
@@ -50,7 +51,7 @@ def build_index(root):
                 base, lod = m.group("base").lower(), int(m.group("lod"))
             else:
                 base, lod = stem.lower(), 0
-            path = os.path.join(dirpath, fn)
+            path = long_path(os.path.join(dirpath, fn))     # (deeper than MAX_PATH: keeps the prefix)
             slot = index.setdefault(base, {})
             old = slot.get(lod)
             if old is None or prio[ext] < prio[os.path.splitext(old)[1].lower()]:
@@ -231,6 +232,53 @@ def _make_decimated(src_obj, ratio, name):
     return obj
 
 
+FAILED = {}         # model key -> (file, error) of the files that could not be read (operators: "Import failed")
+
+
+def _radius(objs):
+    """Radius (Blender units) of model-space meshes around their origin."""
+    r = 0.0
+    for o in objs:
+        n = len(o.data.vertices)
+        if n:
+            co = np.empty(n * 3, dtype=np.float32)
+            o.data.vertices.foreach_get("co", co)
+            r = max(r, float(np.sqrt((co.reshape(-1, 3) ** 2).sum(1)).max()))
+    return r
+
+
+def _word_regex(text):
+    words = [w.strip().lower() for w in text.split(",") if w.strip()]
+    if not words:
+        return None
+    parts = [re.escape(w).replace(r"\*", r"[^/]*") for w in words]
+    return re.compile(r"(?:^|[/_\-\.\d])(?:" + "|".join(parts) + r")(?=$|[/_\-\.\d])")
+
+
+def keep_full_detail(key, radius, settings):
+    """Why a model gets no decimated LODs, or None. The Decimate collapse makes holes in buildings (thin walls,
+    façades made of several parts: at LOD2 only 25% of the faces are left) and big models are seen from far
+    away: they keep their full mesh."""
+    if radius >= settings.auto_lod_max_radius:
+        return f"radius {radius:.0f} m"
+    rx = _word_regex(settings.auto_lod_skip_names)
+    if rx is not None and rx.search(key.lower()):
+        return "architecture"
+    return None
+
+
+def lod_ratios(settings):
+    """Face ratio of each generated LOD: ratio^i, never below the minimum ratio (levels that would be the same
+    as the previous one are not generated)."""
+    out = []
+    for i in range(1, settings.max_lods):
+        r = max(settings.auto_lod_ratio ** i, settings.auto_lod_min_ratio)
+        if out and r >= out[-1] - 1e-6:
+            break
+        out.append(r)
+    return out
+
+
 # --------------------------------------------------------------------------
 # Main API
 # --------------------------------------------------------------------------
@@ -261,6 +309,7 @@ def ensure_model(key, files, settings, scene):
             new = _import_file(files[lod])
         except Exception as exc:  # noqa: BLE001
             print(f"[R5] Import failed {files[lod]}: {exc}")
+            FAILED.setdefault(key, (files[lod], str(exc)))
             continue
         meshes = _strip_to_meshes(new)
         if not meshes:
@@ -306,13 +355,13 @@ def ensure_model(key, files, settings, scene):
             if settings.merge_distance > 0:
                 _merge_by_distance(o, settings.merge_distance)
 
-    # Generated LODs when the model only has one
-    if settings.use_lod and settings.auto_generate_lods and len(ordered) == 1 and not fx:
-        ratios = [settings.auto_lod_ratio ** i for i in range(1, settings.max_lods)]
+    # Generated LODs when the model only has one (r5mex exports LOD0 only)
+    if settings.use_lod and settings.auto_generate_lods and len(ordered) == 1 and not fx \
+            and keep_full_detail(key, _radius(ordered[0]), settings) is None:
         base = ordered[0]
         tri_count = sum(len(o.data.polygons) for o in base)
         if tri_count >= settings.auto_lod_min_faces:
-            for i, r in enumerate(ratios, start=1):
+            for i, r in enumerate(lod_ratios(settings), start=1):
                 ordered.append([_make_decimated(o, r, f"{lod_collection_name(key, i)}_{j}")
                                 for j, o in enumerate(base)])
 

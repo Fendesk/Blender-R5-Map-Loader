@@ -10,6 +10,8 @@ import os
 import re
 import struct
 
+from .placement import long_path
+
 _LANG = re.compile(r"^(english|french|german|italian|japanese|korean|polish|portuguese|russian|spanish|"
                    r"tchinese|schinese|mspanish)")
 
@@ -32,7 +34,7 @@ class VpkEntry:
 
 
 def read_dir(dir_path):
-    with open(dir_path, "rb") as f:
+    with open(long_path(dir_path), "rb") as f:
         b = f.read()
     magic, major, minor, _dsize, _ssize = struct.unpack_from("<IHHII", b, 0)
     if magic != 0x55AA1234:
@@ -87,7 +89,7 @@ def read_entry(dir_path, entry):
     if entry.compressed:
         raise ValueError(f"{entry.path} is compressed in the VPK (LZHAM): extract it with a VPK tool")
     out = bytearray()
-    with open(archive_path(dir_path, entry.pack), "rb") as f:
+    with open(long_path(archive_path(dir_path, entry.pack)), "rb") as f:
         for ao, cs, _us in entry.chunks:
             f.seek(ao)
             out += f.read(cs)

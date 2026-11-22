@@ -19,7 +19,9 @@ import bpy
 import numpy as np
 
 GROUP = "APX_Instancer"
-GROUP_VERSION = 6          # 5: region = disc mesh (several POIs); 6: LOD cross-fade ("Fade Width", r5_fade)
+GROUP_VERSION = 8          # 5: region = disc mesh (several POIs); 6: LOD cross-fade ("Fade Width", r5_fade)
+                           # 7: final render values ("R ..." sockets, Is Viewport / Active Camera)
+                           # 8: "Keep Size": props larger than this are never hidden by their size on screen
 MAX_LEVELS = 5
 PROBE = "APX_LOD_Probe"
 FADE_ATTR = "r5_fade"      # instance attribute read by the LOD fade shader mask (motion.py)
@@ -74,11 +76,23 @@ def _build(ng):
     _sock(ng, "Min Screen", "NodeSocketFloat", default=0.0)
     _sock(ng, "Region", "NodeSocketObject")
     _sock(ng, "Fade Width", "NodeSocketFloat", default=0.0)     # LOD cross-fade band (fraction of each distance)
+    # Final render values (7). They are set beforehand from the main thread: nothing is changed during a render
+    # (changing the modifiers from the render handlers crashed animation renders while the interface redrew).
+    # R Camera: the probe is the scene's active camera (LOD from the camera on every frame).
+    _sock(ng, "R Use LOD", "NodeSocketBool", default=False)
+    _sock(ng, "R Forced", "NodeSocketInt", default=0)
+    _sock(ng, "R Min Screen", "NodeSocketFloat", default=0.0)
+    _sock(ng, "R Fade Width", "NodeSocketFloat", default=0.0)
+    _sock(ng, "R Camera", "NodeSocketBool", default=False)
+    _sock(ng, "R TanX", "NodeSocketFloat", default=1.0)
+    _sock(ng, "R TanY", "NodeSocketFloat", default=1.0)
+    _sock(ng, "R Mode", "NodeSocketFloat", default=0.5)
+    _sock(ng, "Keep Size", "NodeSocketFloat", default=1e9)    # (8) radius x scale above which the size is ignored
 
     N, L = ng.nodes, ng.links
-    gi = N.new("NodeGroupInput"); gi.location = (-2200, 0)
+    gi = N.new("NodeGroupInput"); gi.location = (-2600, 0)
     go = N.new("NodeGroupOutput"); go.location = (1100, 0)
-    G = gi.outputs
+    G0 = gi.outputs
 
     def link(a, b):
         L.new(a, b)
@@ -112,20 +126,51 @@ def _build(ng):
             link(b, n.inputs[1])
         return n.outputs[0]
 
-    # --- probe ---------------------------------------------------------------
-    oi = N.new("GeometryNodeObjectInfo"); oi.location = (-2000, 300)
+    # --- viewport / final render --------------------------------------------
+    isv = N.new("GeometryNodeIsViewport"); isv.location = (-2600, 900)
+    rendering = boolean("NOT", isv.outputs[0], None, (-2450, 900))
+
+    def pick(kind, viewport, render, loc):
+        """Switch on 'final render': viewport value / render value."""
+        n = N.new("GeometryNodeSwitch"); n.input_type = kind; n.location = loc
+        link(rendering, n.inputs[0]); link(viewport, n.inputs[1]); link(render, n.inputs[2])
+        return n.outputs[0]
+
+    G = {s.name: s for s in G0}
+    G["Use LOD"] = pick("BOOLEAN", G0["Use LOD"], G0["R Use LOD"], (-2300, 1000))
+    G["Forced"] = pick("INT", G0["Forced"], G0["R Forced"], (-2300, 940))
+    G["Min Screen"] = pick("FLOAT", G0["Min Screen"], G0["R Min Screen"], (-2300, 880))
+    G["Fade Width"] = pick("FLOAT", G0["Fade Width"], G0["R Fade Width"], (-2300, 820))
+    use_cam = boolean("AND", rendering, G0["R Camera"], (-2300, 760))
+
+    # --- probe (the viewport's probe empty, or the active camera at render) -----
+    oi = N.new("GeometryNodeObjectInfo"); oi.location = (-2200, 300)
     oi.transform_space = "RELATIVE"
     link(G["Probe"], oi.inputs["Object"])
+    cam = N.new("GeometryNodeInputActiveCamera"); cam.location = (-2400, 500)
+    oc = N.new("GeometryNodeObjectInfo"); oc.location = (-2200, 550)
+    oc.transform_space = "RELATIVE"
+    link(cam.outputs[0], oc.inputs["Object"])
+
+    def pick_cam(kind, a, b, loc):
+        n = N.new("GeometryNodeSwitch"); n.input_type = kind; n.location = loc
+        link(use_cam, n.inputs[0]); link(a, n.inputs[1]); link(b, n.inputs[2])
+        return n.outputs[0]
+
+    eye = pick_cam("VECTOR", oi.outputs["Location"], oc.outputs["Location"], (-2000, 350))
+    eye_rot = pick_cam("ROTATION", oi.outputs["Rotation"], oc.outputs["Rotation"], (-2000, 600))
     pos = N.new("GeometryNodeInputPosition"); pos.location = (-2000, 0)
     vsub = N.new("ShaderNodeVectorMath"); vsub.operation = "SUBTRACT"; vsub.location = (-1800, 150)
-    link(pos.outputs[0], vsub.inputs[0]); link(oi.outputs["Location"], vsub.inputs[1])
+    link(pos.outputs[0], vsub.inputs[0]); link(eye, vsub.inputs[1])
     vlen = N.new("ShaderNodeVectorMath"); vlen.operation = "LENGTH"; vlen.location = (-1600, 250)
     link(vsub.outputs[0], vlen.inputs[0])
     dist = vlen.outputs["Value"]
 
     psc = N.new("ShaderNodeSeparateXYZ"); psc.location = (-1800, 450)
     link(oi.outputs["Scale"], psc.inputs[0])
-    tanx, tany, mode = psc.outputs[0], psc.outputs[1], psc.outputs[2]
+    tanx = pick_cam("FLOAT", psc.outputs[0], G0["R TanX"], (-1650, 420))
+    tany = pick_cam("FLOAT", psc.outputs[1], G0["R TanY"], (-1650, 480))
+    mode = pick_cam("FLOAT", psc.outputs[2], G0["R Mode"], (-1650, 540))
 
     # Prop size = model radius x point scale
     scl = N.new("GeometryNodeInputNamedAttribute"); scl.data_type = "FLOAT"; scl.location = (-2000, -300)
@@ -161,7 +206,7 @@ def _build(ng):
 
     # --- field of view (frustum) ---------------------------------------------
     inv = N.new("FunctionNodeInvertRotation"); inv.location = (-1600, 600)
-    link(oi.outputs["Rotation"], inv.inputs[0])
+    link(eye_rot, inv.inputs[0])
     rv = N.new("FunctionNodeRotateVector"); rv.location = (-1400, 600)
     link(vsub.outputs[0], rv.inputs["Vector"]); link(inv.outputs[0], rv.inputs["Rotation"])
     vl = N.new("ShaderNodeSeparateXYZ"); vl.location = (-1200, 600)
@@ -187,6 +232,8 @@ def _build(ng):
     small = compare("LESS_THAN", screen, G["Min Screen"], (-550, -450))
     sc_on = compare("GREATER_THAN", mode, 0.25, (-550, -600))
     sc_fail = boolean("AND", small, sc_on, (-400, -500))
+    big = compare("GREATER_EQUAL", size, G["Keep Size"], (-550, -650))
+    sc_fail = boolean("NIMPLY", sc_fail, big, (-300, -550))
 
     # --- distance culling ------------------------------------------------------
     far = compare("GREATER_EQUAL", d, G["Cull"], (-700, -750))
@@ -421,8 +468,29 @@ def viewport_fade(s):
     return s.lod_fade_width if (getattr(s, "lod_fade", False) and getattr(s, "lod_fade_viewport", False)) else 0.0
 
 
+def render_values(scene, viewport):
+    """The "R ..." inputs: what the final render uses (Render panel, 'At render time'). viewport: the viewport
+    values of the same modifier ("Use LOD", "Forced", "Min Screen", "Fade Width") for 'Keep the viewport state'.
+    Computed from the main thread whenever a setting or the camera changes, never during the render."""
+    s = scene.r5_settings
+    out = {"R Use LOD": False, "R Forced": 0, "R Min Screen": 0.0, "R Fade Width": 0.0, "R Camera": False,
+           "R TanX": 1.0, "R TanY": 1.0, "R Mode": 0.5}
+    if not s.use_lod:
+        out["R Forced"] = s.forced_lod
+    elif s.render_mode == "KEEP":
+        out.update({"R Use LOD": viewport["Use LOD"], "R Forced": viewport["Forced"],
+                    "R Min Screen": viewport["Min Screen"], "R Fade Width": viewport["Fade Width"]})
+    elif s.render_mode == "CAMERA" and scene.camera is not None:
+        from . import lod_system, motion
+        v = lod_system.camera_view(scene, frustum=s.render_frustum)
+        out.update({"R Use LOD": True, "R Camera": True, "R Min Screen": s.render_min_screen_pct / 100.0,
+                    "R Fade Width": float(s.lod_fade_width if (s.lod_fade and motion.lod_fade_ready()) else 0.0),
+                    "R TanX": float(v.tanx), "R TanY": float(v.tany), "R Mode": float(v.mode)})
+    return out
+
+
 def apply_settings(scene, force_level=None, min_screen=None, fade=None):
-    """Push the scene's LOD / culling settings into every modifier.
+    """Push the scene's LOD / culling settings into every modifier (viewport and final render values).
     fade: LOD cross-fade band (None = the viewport setting, see viewport_fade)."""
     from . import library
     from .regions import get_region
@@ -437,6 +505,7 @@ def apply_settings(scene, force_level=None, min_screen=None, fade=None):
     region = get_region(scene)
     if min_screen is None:
         min_screen = (s.min_screen_pct / 100.0) if s.cull_small_props else 0.0
+    rvals = None
     n = 0
     for o in instancer_objects(scene):
         mod = o.modifiers.get("APX_Instancer")
@@ -458,12 +527,17 @@ def apply_settings(scene, force_level=None, min_screen=None, fade=None):
             "Frustum Margin": s.frustum_margin,
             "Min Screen": min_screen,
             "Fade Width": float(viewport_fade(s) if fade is None else fade),
+            "Keep Size": s.cull_keep_radius if s.cull_keep_radius > 0 else 1e9,
         }
         for i in range(1, MAX_LEVELS):
             vals[f"D{i}"] = dists[i - 1] if i - 1 < len(dists) else 1e12
+        if rvals is None:
+            rvals = render_values(scene, vals)
+        vals.update(rvals)
         sky = bool(o.get("apx_sky"))
         if sky:
-            vals.update({"Use LOD": False, "Forced": 0, "Fade Width": 0.0})
+            vals.update({"Use LOD": False, "Forced": 0, "Fade Width": 0.0,
+                         "R Use LOD": False, "R Forced": 0, "R Fade Width": 0.0, "R Camera": False})
         changed = False
         for k, v in vals.items():
             changed |= mod_set(mod, ids[k], v)
@@ -472,4 +546,7 @@ def apply_settings(scene, force_level=None, min_screen=None, fade=None):
         if changed:
             o.update_tag()
             n += 1
+    if n:
+        from . import lod_system
+        lod_system.hidden_dirty()
     return n

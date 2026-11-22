@@ -157,10 +157,33 @@ def _rotators(scene):
         return []
 
 
+# Names of the parts that never turn with a rotator, even standing at its pivot (Broken Moon's Terraformer: the
+# interior railings, curved walls and floor panels share the pivot of its fan)
+_STATIC_PART_RE = re.compile(r"wall|floor|railing|window|stair|door|pillar|column|support|foundation|ceiling|"
+                             r"roof|bldg|building|pipe|conduit|decal|godray|cable|wire|ladder|_base(_|$)")
+# Moving parts found on the axis of a rotator, away from its pivot (the Terraformer fan is 18 m above it)
+_SPIN_PART_RE = re.compile(r"fan_?blade|blade|rotor|turbine|propeller|(^|_)fan(_|\d|$)|spinning|spinner")
+AXIS_TOL = 1.0             # m from the rotation axis
+AXIS_REACH = 60.0          # m along the axis
+
+
+def _rotator_members(r):
+    """(free positions (N,3): pivot and brush origins, [(position, model key)] of the linked props)"""
+    pos = np.array(r.get("members") or [], np.float64).reshape(-1, 3)
+    models = r.get("member_models") or [None] * len(pos)
+    free = np.array([p for p, m in zip(pos, models) if not m], np.float64).reshape(-1, 3)
+    linked = [(p, m) for p, m in zip(pos, models) if m]
+    return free, linked
+
+
 def _plan(scene):
-    """{instancer object: {attribute: array}} for every prop that moves, and the rotator brush objects."""
+    """{instancer object: {attribute: array}} for every prop that moves, and the rotator brush objects.
+    Map rotators move: the props they link to (same model, same place), the props standing at their pivot or
+    brush origins (except architecture: _STATIC_PART_RE), and the fans / blades on their axis when they link to no
+    prop (nearest rotator along the axis)."""
     rots = _rotators(scene)
-    members = [(np.array(r["members"], np.float64).reshape(-1, 3), r) for r in rots if r.get("members")]
+    members = [(_rotator_members(r), r) for r in rots if r.get("members")]
+    axis_rots = [r for (free, linked), r in members if not linked]
     objs = [o for o in gn_instancer.instancer_objects(scene) if not o.get("apx_sky") and len(o.data.vertices)]
     plans = {}
     group_pts = {}           # group rule index -> [(object, point index, position, is_base)]
@@ -181,16 +204,44 @@ def _plan(scene):
         pos, mats, scl = _point_frames(o)
         n = len(pos)
         done = np.zeros(n, bool)
+        static_part = bool(_STATIC_PART_RE.search(key))
+
+        def assign(sel, r):
+            p = plan_of(o, n)
+            p["r5_mv_axis"][sel] = r["axis"]
+            p["r5_mv_pivot"][sel] = r["pivot"]
+            p["r5_mv_rate"][sel] = r["rate"]
+
         # 1) rotators of the map
-        for mpos, r in members:
-            d = np.linalg.norm(pos[:, None, :] - mpos[None, :, :], axis=2).min(1)
-            sel = (d < MEMBER_TOL) & ~done
+        for (free, linked), r in members:
+            sel = np.zeros(n, bool)
+            for mp, mk in linked:
+                if mk == key:
+                    sel |= np.linalg.norm(pos - mp, axis=1) < 0.1
+            if len(free) and not static_part:
+                d = np.linalg.norm(pos[:, None, :] - free[None, :, :], axis=2).min(1)
+                sel |= d < MEMBER_TOL
+            sel &= ~done
             if sel.any():
-                p = plan_of(o, n)
-                p["r5_mv_axis"][sel] = r["axis"]
-                p["r5_mv_pivot"][sel] = r["pivot"]
-                p["r5_mv_rate"][sel] = r["rate"]
+                assign(sel, r)
                 done |= sel
+        if axis_rots and _SPIN_PART_RE.search(key) and not done.all():
+            best = np.full(n, np.inf)
+            pick = np.full(n, -1)
+            for i, r in enumerate(axis_rots):
+                ax = np.array(r["axis"], np.float64)
+                ax /= max(np.linalg.norm(ax), 1e-9)
+                v = pos - np.array(r["pivot"], np.float64)
+                along = v @ ax
+                perp = np.linalg.norm(v - along[:, None] * ax[None, :], axis=1)
+                ok = (perp < AXIS_TOL) & (np.abs(along) < AXIS_REACH) & (np.abs(along) < best) & ~done
+                best[ok] = np.abs(along[ok])
+                pick[ok] = i
+            for i, r in enumerate(axis_rots):
+                sel = pick == i
+                if sel.any():
+                    assign(sel, r)
+                    done |= sel
         if rule is None or done.all():
             continue
         kind = rule[0]

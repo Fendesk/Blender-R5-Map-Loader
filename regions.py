@@ -11,6 +11,7 @@ the visible part.
 """
 
 import math
+import re
 import string
 
 import bpy
@@ -276,26 +277,17 @@ def ensure_clip_modifiers(scene):
 # --------------------------------------------------------------------------
 # Points of interest
 # --------------------------------------------------------------------------
-def add_zones(scene, zones, unit, offset):
-    """Create POIs from the zones read in the entity files."""
-    s = scene.r5_settings
-    existing = {p.name for p in s.pois}
+def zone_list(zones, default_radius):
+    """The POIs made from the zones of the entity files: [(name, kind, origin, radius)], game units.
+    default_radius (game units): for named zones without a radius. Used by the POI list and by the import of a
+    single POI, so both give the same names."""
+    out, seen = [], set()
     named = [z for z in zones if z.kind == "named"]
     named_pos = np.array([z.origin for z in named], dtype=np.float64).reshape(-1, 3)
-
-    def to_bl(o):
-        return Vector((o[0] * unit - offset.x, o[1] * unit - offset.y, o[2] * unit - offset.z))
-
-    added = 0
     for z in named:
-        if z.name in existing:
-            continue
-        p = s.pois.add()
-        p.name, p.kind = z.name, "zone"
-        p.center = to_bl(z.origin)
-        p.radius = z.radius * unit if z.radius > 0 else s.poi_default_radius
-        existing.add(p.name)
-        added += 1
+        if z.name not in seen:
+            seen.add(z.name)
+            out.append((z.name, "zone", z.origin, z.radius if z.radius > 0 else default_radius))
     # Large loot zones (radius >= 1000 units) = areas of interest
     loot = sorted((z for z in zones if z.kind == "loot" and z.radius >= 1000), key=lambda z: -z.radius)
     for i, z in enumerate(loot, start=1):
@@ -306,12 +298,24 @@ def add_zones(scene, zones, unit, offset):
             if d[j] < max(z.radius * 2, 8000):
                 near = f" near {named[j].name}"
         name = f"loot {z.name.replace('zone_', '')} {i}{near}"
+        if name not in seen:
+            seen.add(name)
+            out.append((name, "loot", z.origin, z.radius * 1.2))
+    return out
+
+
+def add_zones(scene, zones, unit, offset):
+    """Create POIs from the zones read in the entity files."""
+    s = scene.r5_settings
+    existing = {p.name for p in s.pois}
+    added = 0
+    for name, kind, o, r in zone_list(zones, s.poi_default_radius / unit):
         if name in existing:
             continue
         p = s.pois.add()
-        p.name, p.kind = name, "loot"
-        p.center = to_bl(z.origin)
-        p.radius = z.radius * unit * 1.2
+        p.name, p.kind = name, kind
+        p.center = Vector((o[0] * unit - offset.x, o[1] * unit - offset.y, o[2] * unit - offset.z))
+        p.radius = r * unit
         existing.add(name)
         added += 1
     return added
@@ -483,10 +487,17 @@ class R5_OT_poi_grid(bpy.types.Operator):
 class R5_UL_pois(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         icon = {"zone": "BOOKMARKS", "loot": "PACKAGE", "grid": "MESH_GRID", "user": "PINNED"}.get(item.kind, "DOT")
-        row = layout.row(align=True)
+        split = layout.split(factor=0.8, align=True)
+        row = split.row(align=True)
         row.prop(item, "use", text="")
-        row.prop(item, "name", text="", emboss=False, icon=icon)
-        row.label(text=f"{item.radius:.0f} m")
+        if item.kind == "zone":
+            # map POIs: "zone_1_blossom_drive" -> "blossom drive" (the filter still searches the full name)
+            row.label(text=re.sub(r"^zone_\d+_", "", item.name).replace("_", " "), icon=icon)
+        else:
+            row.prop(item, "name", text="", emboss=False, icon=icon)
+        row = split.row(align=True)
+        row.alignment = "RIGHT"
+        row.label(text=f"{item.radius:.0f}")
 
 
 CLASSES = (R5_POI, R5_OT_region_poi, R5_OT_poi_check, R5_OT_region_cursor, R5_OT_region_clear, R5_OT_poi_goto,

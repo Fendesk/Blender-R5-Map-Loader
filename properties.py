@@ -192,7 +192,13 @@ class R5_Settings(bpy.types.PropertyGroup):
     auto_entities: BoolProperty(
         name="Export's entities", default=True,
         description="With an .mprt and an empty Entities field: also load entities/<map>_script.ent next to it "
-                    "(RSXreloaded exports): doors, loot bins, evac towers, ziplines, POIs")
+                    "(r5mex exports): doors, loot bins, evac towers, ziplines, POIs")
+    texture_other_exports: BoolProperty(
+        name="Textures from other exports", default=True,
+        description="A material exported without its textures takes them, by material name, from the other map "
+                    "exports next to this one (same folder or one level up). R5Flowstate S30 exports have some "
+                    "trims without textures (s2s_metal_trims_02_vc, district_bronze_trim_01, trim_metal_01...) "
+                    "that the S21 and retail exports have")
     import_skybox: BoolProperty(
         name="3D skybox", default=True,
         description="With an .mprt: also load <map>_skybox.mprt next to it (r5mex exports): the distant scenery "
@@ -252,6 +258,20 @@ class R5_Settings(bpy.types.PropertyGroup):
     auto_lod_ratio: FloatProperty(name="Decimation ratio", default=0.5, min=0.05, max=0.95,
                                   description="Each LOD keeps this ratio of the previous one's faces")
     auto_lod_min_faces: IntProperty(name="Min faces to generate", default=200, min=0)
+    auto_lod_min_ratio: FloatProperty(
+        name="Min. ratio", default=0.25, min=0.01, max=1.0,
+        description="Generated LODs never keep fewer faces than this ratio of the model (0.5 per level would "
+                    "leave 12.5% at LOD3 and make holes in the meshes)")
+    auto_lod_max_radius: FloatProperty(
+        name="Keep full detail above (m)", default=10.0, min=0.0, subtype="DISTANCE",
+        description="Models with a larger radius get no decimated LODs: they are seen from far away and "
+                    "decimation makes holes in them")
+    auto_lod_skip_names: StringProperty(
+        name="Never decimate", description="Comma separated words of model names that keep their full mesh "
+                                           "(architecture: decimation makes holes in thin walls and façades). "
+                                           "* = wildcard",
+        default="bldg*,building*,wall*,terrain*,cliff*,rock*,floor*,roof*,stair*,bridge*,facade*,pillar*,"
+                "column*,arch*,tower*,house*,ground*,road*,platform*,dock*,pier*,fence*,window*,door*")
     lod_distances: FloatVectorProperty(
         name="LOD distances (m)", size=4, default=(25.0, 60.0, 150.0, 400.0), min=0.0,
         update=_lod_changed, description="Distance at which LOD1, LOD2, LOD3, LOD4 start")
@@ -273,6 +293,10 @@ class R5_Settings(bpy.types.PropertyGroup):
         name="Min. size on screen (%)", default=1.0, min=0.0, max=20.0, precision=2, update=_lod_changed,
         description="Minimum prop radius in % of half the screen height (1% ~ 5 pixel radius at 1080p). "
                     "Measured on World's Edge from the ground: 0.6% ~ 19 fps, 1% ~ 35 fps, 2% ~ 48 fps")
+    cull_keep_radius: FloatProperty(
+        name="Always keep props larger than (m)", default=10.0, min=0.0, subtype="DISTANCE", update=_lod_changed,
+        description="Props with a radius (model radius x prop scale) above this are never hidden by their size "
+                    "on screen (buildings stay visible from far away). Also at render time")
     use_frustum: BoolProperty(
         name="Hide outside the field of view", default=True, update=_lod_changed,
         description="Props behind the camera or off screen are not instanced (big FPS gain)")
@@ -307,13 +331,13 @@ class R5_Settings(bpy.types.PropertyGroup):
         items=[("LOD0", "Everything in LOD0", "Maximum quality at render time"),
                ("CAMERA", "LOD from the camera", "Recompute the LODs from the camera on every frame"),
                ("KEEP", "Keep the viewport state", "")],
-        default="CAMERA")
+        default="CAMERA", update=_lod_changed)
     render_frustum: BoolProperty(
-        name="Field of view culling at render", default=False,
+        name="Field of view culling at render", default=False, update=_lod_changed,
         description="Also hide off-screen props at render time (faster, but shadows and reflections of "
                     "off-screen objects disappear)")
     render_min_screen_pct: FloatProperty(
-        name="Min. size on screen at render (%)", default=0.15, min=0.0, max=20.0, precision=2,
+        name="Min. size on screen at render (%)", default=0.15, min=0.0, max=20.0, precision=2, update=_lod_changed,
         description="Props smaller than this on the final image are skipped at render time (0 = keep all)")
     lod_fade: BoolProperty(
         name="Smooth LOD transitions", default=False, update=_lod_fade_changed,
