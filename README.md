@@ -59,11 +59,11 @@ In the order of the work, most used buttons on top, rarely used settings in clos
   instead (also in View > Cameras). Cameras go in the *R5 Cameras* collection and stay when the map is replaced.
   *Cycles preview* / *Cycles final* presets, camera-based LOD, smooth LOD transitions in animations.
 
-## Tips
-- Use **Geometry Nodes** instancing for a full map; *Empties* only for *Import an area only*.
-- For fast navigation, use Solid mode with *Color: Texture*.
-- Decals are invisible in Solid mode: they only show in Material Preview / Rendered.
-- The add-on turns on *Render > Lock Interface*: it keeps animation renders of big maps stable.
-- The 3D skybox is a backdrop, as in game: it casts no shadow and blocks no light, and its sky dome is drawn
+> [!TIP]
+> - Use **Geometry Nodes** instancing for a full map; *Empties* only for *Import an area only*.
+> - For fast navigation, use Solid mode with *Color: Texture*.
+> - Decals are invisible in Solid mode: they only show in Material Preview / Rendered.
+> - The add-on turns on *Render > Lock Interface*: it keeps animation renders of big maps stable.
+> - The 3D skybox is a backdrop, as in game: it casts no shadow and blocks no light, and its sky dome is drawn
   unlit. The map is lit by the sun and the world (*Sky* panel).
-- Scale: 1 game unit = 0.0254 m.
+> - Scale: 1 game unit = 0.0254 m.
