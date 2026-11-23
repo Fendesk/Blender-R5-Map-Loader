@@ -136,6 +136,29 @@ def is_water_material(name):
     return bool(_WATER_RE.search(low) and _WATER_SURFACE_RE.search(low) and not _NOT_WATER_RE.search(low))
 
 
+# Moving water laid over the still water: foam, rapids, waterfalls, fountains, wave cards. In game their vertex
+# alpha fades them into the water below (a hard seam between calm and fast water otherwise) and their vertex
+# colour is not a tint (district_waves: dark grey, which turned the waves into black cards).
+_FLOW_RE = re.compile(r"waterfall|water_?fall|foam|rapid|cascade|(^|_)waves?(_|$|\d)|fountain|splash|river_water|"
+                      r"(^|_)fast($|_)")
+_NOT_FLOW_RE = re.compile(r"glow|decal|puddle|stain|caustic|drip|dispenser|pipe|tiles|floor|lily|styro|_ilm|"
+                          r"underwater|under_water|wall|marble|concrete|metal|seat")
+# Water materials whose "emissive" texture is not a light (waterpool_06_vc, waterfall_badlands_rapid_03,
+# caustic_water_01): the game uses it for reflections / foam brightness, in Blender the water glowed at night.
+_WATERISH_RE = re.compile(r"water|ocean|river|rapid|foam|caustic|wave|fountain|pool")
+_REAL_GLOW_RE = re.compile(r"glow|lava|magma|neon|light|lamp|screen|holo")
+
+
+def is_flow_water(name):
+    low = name.lower()
+    return bool(_FLOW_RE.search(low) and not _NOT_FLOW_RE.search(low))
+
+
+def _water_glow_off(name):
+    low = name.lower()
+    return bool(_WATERISH_RE.search(low) and not _REAL_GLOW_RE.search(low))
+
+
 def _water_layers(name):
     """(layer 1 is water, layer 2 is water) of a blend material name ("a_to_b_bm" or "a_b_bm")."""
     low = name.lower()
@@ -166,7 +189,7 @@ _BM_RE = re.compile(r"_bm($|_)")
 # ... which are still real overlays when their name says so
 _BM_OVERLAY_RE = re.compile(r"transparent|decal|_b2t($|_)|_bt($|_)")
 
-MAT_VERSION = 18
+MAT_VERSION = 20
 
 
 def material_group(name):
@@ -751,9 +774,30 @@ def make_additive(mat, strength=1.0):
     mat["r5_additive"] = True
 
 
-def make_unlit(mat):
-    """Sky dome materials (sky, stars, far ground of the 3D skybox): drawn without lighting in game. The base
-    colour becomes an emission (its alpha kept), so the sky shows its own colours, whatever the lights."""
+def image_alpha_used(img):
+    """True when the alpha channel of an image is a real mask (cut-out cards of clouds / cars), not a constant."""
+    if img is None or img.channels < 4 or not img.size[0] or not img.size[1]:
+        return False
+    if "r5_alpha_used" in img:
+        return bool(img["r5_alpha_used"])
+    try:
+        w, h = img.size
+        px = np.empty(w * h * 4, np.float32)
+        img.pixels.foreach_get(px)
+        a = px[3::4][::max(1, (w * h) // 65536)]
+        used = bool(np.mean(a < 0.5) > 0.02)
+    except (RuntimeError, ValueError):
+        used = False
+    img["r5_alpha_used"] = used
+    return used
+
+
+def make_unlit(mat, drop_tint=False, vc_alpha=False):
+    """Sky dome materials (sky, stars, far ground, cloud and traffic cards of the 3D skybox): drawn without lighting
+    in game. The base colour becomes an emission, so the sky shows its own colours, whatever the lights.
+    The transparency is soft: albedo alpha (cards whose mask is only there: E-District's moving clouds were opaque
+    black panels), opacity texture (hard cut-outs made soft) and, with vc_alpha, the vertex alpha that fades the
+    cards out at their borders. drop_tint: the vertex colour is not a tint here (near black on those cards)."""
     if mat is None or not mat.use_nodes or mat.get("r5_unlit"):
         return False
     nt = mat.node_tree
@@ -765,19 +809,57 @@ def make_unlit(mat):
         return False
     em = N.new("ShaderNodeEmission"); em.name = "R5_Unlit"; em.location = (bsdf.location.x, bsdf.location.y + 250)
     base = bsdf.inputs["Base Color"]
-    if base.links:
-        L.new(base.links[0].from_socket, em.inputs["Color"])
+    src = base.links[0].from_socket if base.links else None
+    alb = None
+    if src is not None:
+        node = src.node
+        if node.type == "TEX_IMAGE":
+            alb = node
+        elif node.type == "MIX":
+            a_in, b_in = _sock(node.inputs, "A_Color"), _sock(node.inputs, "B_Color")
+            if a_in is not None and a_in.links and a_in.links[0].from_node.type == "TEX_IMAGE":
+                alb = a_in.links[0].from_node
+            if (drop_tint and a_in is not None and a_in.links and b_in is not None and b_in.links
+                    and b_in.links[0].from_node.type == "VERTEX_COLOR"):
+                src = a_in.links[0].from_socket
+    if src is not None:
+        L.new(src, em.inputs["Color"])
     else:
         em.inputs["Color"].default_value = base.default_value
-    shader = em.outputs[0]
+    terms = []
     alpha = bsdf.inputs["Alpha"]
     if alpha.links:
+        a_src = alpha.links[0].from_socket
+        if a_src.node.type == "MATH" and a_src.node.operation == "GREATER_THAN" and a_src.node.inputs[0].links:
+            a_src = a_src.node.inputs[0].links[0].from_socket       # hard cut-out made soft
+        terms.append(a_src)
+    if alb is not None and image_alpha_used(alb.image) and alb.outputs["Alpha"] not in terms:
+        terms.append(alb.outputs["Alpha"])
+    if vc_alpha:
+        vc = next((n for n in N if n.type == "VERTEX_COLOR"), None)
+        if vc is None:
+            vc = N.new("ShaderNodeVertexColor"); vc.layer_name = "Col"
+            vc.location = (em.location.x - 400, em.location.y + 300)
+        terms.append(vc.outputs["Alpha"])
+    shader = em.outputs[0]
+    if terms:
+        a_out = terms[0]
+        for i, t in enumerate(terms[1:]):
+            m = N.new("ShaderNodeMath"); m.operation = "MULTIPLY"
+            m.location = (em.location.x - 200, em.location.y + 300 + 150 * i)
+            L.new(a_out, m.inputs[0]); L.new(t, m.inputs[1])
+            a_out = m.outputs[0]
         tr = N.new("ShaderNodeBsdfTransparent"); tr.location = (em.location.x, em.location.y + 150)
         mix = N.new("ShaderNodeMixShader"); mix.name = "R5_Unlit_Alpha"; mix.location = (em.location.x + 200, em.location.y)
-        L.new(alpha.links[0].from_socket, mix.inputs[0])
+        L.new(a_out, mix.inputs[0])
         L.new(tr.outputs[0], mix.inputs[1])
         L.new(em.outputs[0], mix.inputs[2])
         shader = mix.outputs[0]
+        # blended, not dithered: the many stacked cloud layers stay smooth in EEVEE (dithering left them grainy).
+        # They are drawn behind everything, far away: the order inside the dome does not show.
+        _set_render_method(mat, "BLENDED")
+        if hasattr(mat, "use_transparency_overlap"):
+            mat.use_transparency_overlap = True
     L.new(shader, out.inputs["Surface"])
     mat.use_backface_culling = False           # seen from inside
     mat["r5_unlit"] = True
@@ -847,7 +929,28 @@ def _build_glow(mat, nt, cast, roles):
     s = N.new("ShaderNodeMath"); s.operation = "MULTIPLY"; s.location = (200, 250)
     s.inputs[1].default_value = 3.0
     L.new(a.outputs[0], s.inputs[0])
-    L.new(s.outputs[0], em.inputs["Strength"])
+    strength = s.outputs[0]
+    # emissiveMultiply: the moving pattern (clouds, noise) inside the hologram; uvDistortion: its wobble.
+    # Both scroll with the animated shaders (motion.py moves every texture of the material).
+    mul_img = _image(cast.texture_path(roles["emissivemul"]), True) if "emissivemul" in roles else None
+    dist_img = _image(cast.texture_path(roles["uvdistortion"]), True) if "uvdistortion" in roles else None
+    if mul_img is not None:
+        mt = N.new("ShaderNodeTexImage"); mt.image = mul_img; mt.label = "emissive multiply"; mt.location = (-600, 600)
+        mb = N.new("ShaderNodeMath"); mb.operation = "MULTIPLY_ADD"; mb.location = (200, 450)
+        L.new(mt.outputs["Color"], mb.inputs[0]); mb.inputs[1].default_value = 0.75; mb.inputs[2].default_value = 0.25
+        s2 = N.new("ShaderNodeMath"); s2.operation = "MULTIPLY"; s2.location = (350, 350)
+        L.new(strength, s2.inputs[0]); L.new(mb.outputs[0], s2.inputs[1])
+        strength = s2.outputs[0]
+        if dist_img is not None:
+            dt = N.new("ShaderNodeTexImage"); dt.image = dist_img; dt.label = "uv distortion"; dt.location = (-1100, 600)
+            uv = N.new("ShaderNodeUVMap"); uv.uv_map = "UVMap"; uv.location = (-1300, 400)
+            off = N.new("ShaderNodeVectorMath"); off.operation = "MULTIPLY_ADD"; off.location = (-850, 600)
+            L.new(dt.outputs["Color"], off.inputs[0])
+            off.inputs[1].default_value = (0.04, 0.04, 0.0); off.inputs[2].default_value = (-0.02, -0.02, 0.0)
+            uvadd = N.new("ShaderNodeVectorMath"); uvadd.operation = "ADD"; uvadd.location = (-800, 450)
+            L.new(uv.outputs[0], uvadd.inputs[0]); L.new(off.outputs[0], uvadd.inputs[1])
+            L.new(uvadd.outputs[0], mt.inputs["Vector"])
+    L.new(strength, em.inputs["Strength"])
     L.new(tr.outputs[0], add.inputs[0])
     L.new(em.outputs[0], add.inputs[1])
     L.new(add.outputs[0], out.inputs["Surface"])
@@ -968,7 +1071,98 @@ def _layer_weight(nt, alpha, loc):
     return _sock(mix.outputs, "Result_Float")
 
 
+# Shader constants of the materials (tints, scroll speeds), when the export has them: <map>_materials.json
+# written by r5mex next to the .mprt / .cast. {material name (lower case): {"emissive_tint": [r, g, b],
+# "albedo_tint": [r, g, b], "emissive_strength": f, "opacity": f, "uv_scroll": [u, v] per second, ...}}
+MATERIAL_PARAMS = {}
+
+
+def set_material_params(params):
+    MATERIAL_PARAMS.clear()
+    for k, v in (params or {}).items():
+        if isinstance(v, dict):
+            MATERIAL_PARAMS[str(k).lower()] = v
+
+
+def _vec3(v):
+    try:
+        if isinstance(v, (int, float)):
+            return (float(v),) * 3
+        v = [float(x) for x in v][:3]
+        return tuple(v) if len(v) == 3 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _tint_socket(nt, sock, rgb, loc):
+    """Multiply what feeds a colour input by rgb."""
+    if sock.is_linked:
+        m = _mix_rgba(nt, loc, "MULTIPLY")
+        _sock(m.inputs, "Factor_Float").default_value = 1.0
+        nt.links.new(sock.links[0].from_socket, _sock(m.inputs, "A_Color"))
+        _sock(m.inputs, "B_Color").default_value = (*rgb, 1.0)
+        nt.links.new(_sock(m.outputs, "Result_Color"), sock)
+    else:
+        c = sock.default_value
+        sock.default_value = (c[0] * rgb[0], c[1] * rgb[1], c[2] * rgb[2], c[3])
+
+
+def _scale_socket(nt, sock, f, loc):
+    if sock.is_linked:
+        m = nt.nodes.new("ShaderNodeMath"); m.operation = "MULTIPLY"; m.location = loc
+        nt.links.new(sock.links[0].from_socket, m.inputs[0])
+        m.inputs[1].default_value = f
+        nt.links.new(m.outputs[0], sock)
+    else:
+        sock.default_value *= f
+
+
+def apply_material_params(mat):
+    """Tints / emission / scroll speed from MATERIAL_PARAMS (the game's shader constants), once per material."""
+    if mat is None or mat.get("r5_params") or not MATERIAL_PARAMS:
+        return
+    p = MATERIAL_PARAMS.get(mat.name.lower())
+    if not p:
+        return
+    mat["r5_params"] = True
+    scroll = p.get("uv_scroll")
+    if isinstance(scroll, (list, tuple)) and len(scroll) >= 2:
+        try:
+            mat["r5_scroll"] = [float(scroll[0]), float(scroll[1])]
+        except (TypeError, ValueError):
+            pass
+    if not mat.use_nodes or mat.node_tree is None:
+        return
+    nt = mat.node_tree
+    et, at = _vec3(p.get("emissive_tint")), _vec3(p.get("albedo_tint"))
+    es = p.get("emissive_strength")
+    for n in list(nt.nodes):
+        x, y = n.location
+        if n.type == "EMISSION":
+            if et:
+                _tint_socket(nt, n.inputs["Color"], et, (x - 200, y - 150))
+            if isinstance(es, (int, float)):
+                _scale_socket(nt, n.inputs["Strength"], float(es), (x - 200, y - 300))
+        elif n.type == "BSDF_PRINCIPLED":
+            if at:
+                _tint_socket(nt, n.inputs["Base Color"], at, (x - 200, y + 150))
+            key = "Emission Color" if "Emission Color" in n.inputs else "Emission"
+            if et and n.inputs[key].is_linked:
+                _tint_socket(nt, n.inputs[key], et, (x - 200, y - 150))
+            if isinstance(es, (int, float)) and "Emission Strength" in n.inputs:
+                _scale_socket(nt, n.inputs["Emission Strength"], float(es), (x - 200, y - 300))
+    if et:
+        mat.diffuse_color = (*[min(1.0, c) for c in et], mat.diffuse_color[3])
+
+
 def get_material(cast, h, settings):
+    mat = _get_material(cast, h, settings)
+    if MATERIAL_PARAMS:
+        apply_material_params(mat)
+    return mat
+
+
+def _get_material(cast, h, settings):
     cm = cast.materials.get(h)
     name = cm.name if cm else "r5_default"
     mat = bpy.data.materials.get(name)
@@ -978,7 +1172,8 @@ def get_material(cast, h, settings):
         mat = bpy.data.materials.new(name)
     elif mat.use_nodes and mat.node_tree:
         _reset_tree(mat)      # material from an older add-on version: rebuilt in place
-        for k in ("r5_additive", "r5_vfx", "r5_energy", "r5_anim", "r5_lodfade", "r5_glow", "r5_vctint", "r5_water", "r5_name_color"):
+        for k in ("r5_additive", "r5_vfx", "r5_energy", "r5_anim", "r5_lodfade", "r5_glow", "r5_vctint", "r5_water", "r5_name_color",
+                  "r5_flow"):
             if k in mat:
                 del mat[k]
     mat["apx_cast"] = MAT_VERSION
@@ -1078,9 +1273,14 @@ def get_material(cast, h, settings):
         vctint = False
         mat["r5_vctint"] = False
         mat["r5_water"] = True
+    flow = (not water and not overlay and group is None and alb is not None and is_flow_water(name))
+    if flow:
+        vctint = False
+        mat["r5_vctint"] = False
+        mat["r5_flow"] = True
     mat["r5_blend"] = alb2 is not None
     col_attr = None
-    if overlay or vctint or alb2 is not None:
+    if overlay or vctint or alb2 is not None or flow:
         col_attr = nt.nodes.new("ShaderNodeVertexColor")
         col_attr.layer_name = "Col"
         col_attr.location = (x, y + 300)
@@ -1209,7 +1409,7 @@ def get_material(cast, h, settings):
             links.remove(lk)
         bsdf.inputs["Roughness"].default_value = 0.1
 
-    em, _ = tex("emissive", False)
+    em, _ = tex("emissive", False) if not _water_glow_off(name) else (None, None)
     if em:
         key = "Emission Color" if "Emission Color" in bsdf.inputs else "Emission"
         e_out = em.outputs["Color"]
@@ -1227,6 +1427,19 @@ def get_material(cast, h, settings):
 
     if op and mode != "NEVER" and not overlay:
         links.new(op.outputs["Color"], bsdf.inputs["Alpha"])
+        _set_render_method(mat, "DITHERED")
+    if flow and mode != "NEVER" and col_attr is not None:
+        # moving water fades into the still water by its vertex alpha (soft, no hard seam)
+        va = col_attr.outputs["Alpha"]
+        old = bsdf.inputs["Alpha"].links
+        if old:
+            src = old[0].from_socket
+            if src.node.type == "MATH" and src.node.operation == "GREATER_THAN" and src.node.inputs[0].links:
+                src = src.node.inputs[0].links[0].from_socket       # hard cut-out made soft
+            m = nt.nodes.new("ShaderNodeMath"); m.operation = "MULTIPLY"; m.location = (x + 450, y + 700)
+            links.new(src, m.inputs[0]); links.new(va, m.inputs[1])
+            va = m.outputs[0]
+        links.new(va, bsdf.inputs["Alpha"])
         _set_render_method(mat, "DITHERED")
 
     if settings.cast_extra_textures:

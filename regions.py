@@ -156,6 +156,14 @@ def _hide_outside(scene, discs):
     for o in scene.objects:
         if not (o.get("apx_world_tile") or "apx_gn" in o):
             continue
+        if o.get("apx_sky"):
+            # the 3D skybox lies kilometres outside the map: it stays, as in game (scenery around the region).
+            # Files saved by 0.20.0 and older had it disabled here: shown again.
+            if o.get(REGION_HIDDEN):
+                o.hide_viewport = False
+                o.hide_render = False
+                del o[REGION_HIDDEN]
+            continue
         bb = _bbox_xy(o)
         if bb is None:
             continue

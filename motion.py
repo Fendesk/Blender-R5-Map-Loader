@@ -559,6 +559,8 @@ def classify(mat):
         return "effect"
     if _WIND_RE.search(low):
         return "wind"
+    if mat.get("r5_scroll"):
+        return "effect"          # scrolls in game (material constants of the export)
     return None
 
 
@@ -674,10 +676,13 @@ def _inject(mat, kind, clock):
     t = cg.outputs[_CLOCK_OF[kind]]
     L = nt.links
     done = False
-    if kind in _SCROLL:
-        du, dv = _SCROLL[kind]
+    own = mat.get("r5_scroll")                 # the game's scroll speed (material constants of the export)
+    if kind in _SCROLL or own:
+        du, dv = _SCROLL.get(kind, (0.0, 0.0))
         if kind == "effect" and "cloud" in mat.name.lower():
             du, dv = 0.004, 0.0
+        if own:
+            du, dv = float(own[0]), float(own[1])
         sc = _new(nt, "ShaderNodeVectorMath", "offset", (-1500, 900))
         sc.operation = "SCALE"
         sc.inputs[0].default_value = (du, dv, 0.0)
@@ -698,15 +703,45 @@ def _inject(mat, kind, clock):
             L.new(add.outputs[0], vin)
             done = True
     if kind in ("screen", "screen_scroll"):
-        # screens and holograms flicker a little
-        for n in [n for n in nt.nodes if n.type in ("BSDF_PRINCIPLED", "EMISSION")]:
+        # screens and holograms flicker a little; holograms also get the bright scan band of a CRT running
+        # through them (model height), like in game
+        glow = bool(mat.get("r5_glow"))
+        gain = cg.outputs["flicker"]
+        if glow:
+            tc = _new(nt, "ShaderNodeTexCoord", "coord", (-1700, 600))
+            sz = _new(nt, "ShaderNodeSeparateXYZ", "z", (-1500, 600))
+            L.new(tc.outputs["Object"], sz.inputs[0])
+            ph = _new(nt, "ShaderNodeMath", "band_phase", (-1300, 600))
+            ph.operation = "MULTIPLY_ADD"
+            L.new(sz.outputs[2], ph.inputs[0]); ph.inputs[1].default_value = 0.6
+            sp = _new(nt, "ShaderNodeMath", "band_speed", (-1500, 450))
+            sp.operation = "MULTIPLY"
+            L.new(t, sp.inputs[0]); sp.inputs[1].default_value = -0.4
+            L.new(sp.outputs[0], ph.inputs[2])
+            fr = _new(nt, "ShaderNodeMath", "band_fract", (-1150, 600)); fr.operation = "FRACT"
+            L.new(ph.outputs[0], fr.inputs[0])
+            dd = _new(nt, "ShaderNodeMath", "band_dist", (-1000, 600)); dd.operation = "SUBTRACT"
+            L.new(fr.outputs[0], dd.inputs[0]); dd.inputs[1].default_value = 0.5
+            ab = _new(nt, "ShaderNodeMath", "band_abs", (-850, 600)); ab.operation = "ABSOLUTE"
+            L.new(dd.outputs[0], ab.inputs[0])
+            bd = _new(nt, "ShaderNodeMath", "band", (-700, 600)); bd.operation = "MULTIPLY_ADD"; bd.use_clamp = True
+            L.new(ab.outputs[0], bd.inputs[0]); bd.inputs[1].default_value = -10.0; bd.inputs[2].default_value = 1.0
+            bg = _new(nt, "ShaderNodeMath", "band_gain", (-550, 600)); bg.operation = "MULTIPLY_ADD"
+            L.new(bd.outputs[0], bg.inputs[0]); bg.inputs[1].default_value = 0.7; bg.inputs[2].default_value = 0.85
+            g2 = _new(nt, "ShaderNodeMath", "gain", (-400, 600)); g2.operation = "MULTIPLY"
+            L.new(bg.outputs[0], g2.inputs[0]); L.new(cg.outputs["flicker"], g2.inputs[1])
+            gain = g2.outputs[0]
+        for n in [n for n in nt.nodes if n.type in ("BSDF_PRINCIPLED", "EMISSION") and not n.name.startswith(TAG)]:
             sock = n.inputs.get("Emission Strength") if n.type == "BSDF_PRINCIPLED" else n.inputs.get("Strength")
-            if sock is None or sock.is_linked:
+            if sock is None:
                 continue
             mul = _new(nt, "ShaderNodeMath", f"flicker_{n.name}", (n.location.x - 200, n.location.y - 400))
             mul.operation = "MULTIPLY"
-            mul.inputs[0].default_value = sock.default_value
-            L.new(cg.outputs["flicker"], mul.inputs[1])
+            if sock.is_linked:
+                L.new(sock.links[0].from_socket, mul.inputs[0])
+            else:
+                mul.inputs[0].default_value = sock.default_value
+            L.new(gain, mul.inputs[1])
             L.new(mul.outputs[0], sock)
             done = True
     if kind in ("wind", "cloth"):
@@ -843,7 +878,7 @@ def _remove_tagged(mat, prefix):
     L = nt.links
     for n in tagged:
         # a vector offset / mix inserted in front of existing links: reconnect its original source
-        if n.name.startswith(f"{TAG}_add_") and n.inputs[0].is_linked:
+        if n.name.startswith((f"{TAG}_add_", f"{TAG}_flicker_")) and n.inputs[0].is_linked:
             src = n.inputs[0].links[0].from_socket
             if not src.node.name.startswith(prefix):
                 for lk in list(n.outputs[0].links):

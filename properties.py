@@ -422,15 +422,40 @@ class R5_Settings(bpy.types.PropertyGroup):
         description="Ozone layer: absorbs orange light, deeper blue sky")
     # Fog (volume box around the map)
     sky_fog: BoolProperty(name="Volumetric fog", default=False, update=_sky_changed,
-                          description="Fog filling the map (a volume box around it). Heavier to render")
+                          description="Height fog filling the map, lit by the sun and the sky (a volume box around "
+                                      "the map). Starts from the map's own fog when the export has it. Heavier to "
+                                      "render")
     sky_fog_density: FloatProperty(
-        name="Fog density", default=0.0003, min=0.0, soft_max=0.01, precision=5, step=0.001, update=_sky_changed,
-        description="Per metre. 0.0003 = about half the light gone after 2.3 km")
-    sky_fog_color: FloatVectorProperty(name="Fog colour", subtype="COLOR", size=3, min=0.0, max=1.0,
+        name="Density", default=0.0004, min=0.0, soft_max=0.01, precision=5, step=0.001, update=_sky_changed,
+        description="Per metre, at the fog base. 0.0004 = about 1/3 of the light gone over 1 km")
+    sky_fog_base: FloatProperty(name="Base height", default=0.0, subtype="DISTANCE", update=_sky_changed,
+                                description="Height where the fog is densest (below it, the fog stays as dense)")
+    sky_fog_thickness: FloatProperty(name="Thickness", default=80.0, min=1.0, soft_max=2000.0, subtype="DISTANCE",
+                                     update=_sky_changed,
+                                     description="The fog gets half as dense every this many metres above its base "
+                                                 "(low: ground mist; high: an even haze)")
+    sky_fog_above: FloatProperty(name="Above the layer", default=0.15, min=0.0, max=1.0, subtype="FACTOR",
+                                 update=_sky_changed,
+                                 description="Density kept high above the layer, relative to the base: 0, the fog "
+                                             "only covers the ground; 1, an even fog at every height")
+    sky_fog_patchiness: FloatProperty(name="Patches", default=0.5, min=0.0, max=1.0, subtype="FACTOR",
+                                      update=_sky_changed,
+                                      description="0: even fog; 1: drifting banks of mist with clear gaps")
+    sky_fog_patch_size: FloatProperty(name="Patch size", default=120.0, min=1.0, soft_max=1000.0,
+                                      subtype="DISTANCE", update=_sky_changed)
+    sky_fog_wind: FloatProperty(name="Wind", default=1.5, soft_min=0.0, soft_max=20.0, update=_sky_changed,
+                                description="Speed the patches drift at when the timeline plays (m/s)")
+    sky_fog_color: FloatVectorProperty(name="Colour", subtype="COLOR", size=3, min=0.0, max=1.0,
                                        default=(0.75, 0.82, 0.9), update=_sky_changed)
-    sky_fog_anisotropy: FloatProperty(name="Fog anisotropy", default=0.3, min=-0.9, max=0.9, update=_sky_changed,
-                                      description="> 0: the fog glows towards the sun")
-    sky_fog_distance: FloatProperty(name="Fog range (EEVEE)", default=3000.0, min=10.0, subtype="DISTANCE",
+    sky_fog_anisotropy: FloatProperty(name="Sun glow", default=0.4, min=-0.9, max=0.9, update=_sky_changed,
+                                      description="Anisotropy: > 0, the fog glows towards the sun (forward "
+                                                  "scattering, like real mist)")
+    sky_fog_glow: FloatProperty(name="Self-lit", default=0.0, min=0.0, soft_max=2.0, precision=3, step=1,
+                                update=_sky_changed,
+                                description="Brightness the fog takes by itself, in its colour, whatever the light "
+                                            "(0: lit by the sun and the sky only). The map's fog sets it to the "
+                                            "game's fog brightness: the city glow in the night fog of E-District")
+    sky_fog_distance: FloatProperty(name="Range (EEVEE)", default=3000.0, min=10.0, subtype="DISTANCE",
                                     update=_sky_changed,
                                     description="EEVEE only computes volumes up to this distance")
     sky_add_sun: BoolProperty(name="Add a sun lamp", default=True, update=_sky_changed)

@@ -18,6 +18,7 @@ The sun lamp has its own colour. Value changes are applied live, without rebuild
 
 import json
 import math
+import re
 import os
 
 import bpy
@@ -198,13 +199,14 @@ def _atmosphere(nt, color, s, mean_lum):
 
 
 FOG = "R5_Fog"
+FOG_VERSION = 4
 
 
 def _fog_bounds(scene):
     """Box around the map geometry / props (meters), with some margin and height for the haze."""
     lo = hi = None
     for o in scene.objects:
-        if not (o.get("apx_world_tile") or "apx_gn" in o) or o.type != "MESH":
+        if not (o.get("apx_world_tile") or "apx_gn" in o) or o.type != "MESH" or o.get("apx_sky"):
             continue
         for c in o.bound_box:
             wv = o.matrix_world @ Vector(c)
@@ -212,45 +214,174 @@ def _fog_bounds(scene):
             hi = wv.copy() if hi is None else Vector(map(max, hi, wv))
     if lo is None:
         return (-2000.0, -2000.0, -50.0), (2000.0, 2000.0, 600.0)
-    return (lo.x - 300, lo.y - 300, lo.z - 20), (hi.x + 300, hi.y + 300, hi.z + 400)
+    return (lo.x - 400, lo.y - 400, lo.z - 30), (hi.x + 400, hi.y + 400, hi.z + 500)
+
+
+def _remove_fog():
+    ob = bpy.data.objects.get(FOG)
+    if ob is not None:
+        me = ob.data
+        bpy.data.objects.remove(ob)
+        if me is not None and me.users == 0:
+            bpy.data.meshes.remove(me)
+    mat = bpy.data.materials.get(FOG)
+    if mat is not None and mat.users == 0:
+        bpy.data.materials.remove(mat)
+
+
+def _fog_material(scene):
+    """Height fog: dense near the ground, thinning out with height (halved every *Thickness* metres), broken
+    into slowly drifting patches by a noise, faded out at the sides and top of its box (no visible wall)."""
+    mat = bpy.data.materials.get(FOG)
+    if mat is not None and mat.get("r5_fog_ver") == FOG_VERSION and mat.node_tree:
+        return mat
+    if mat is None:
+        mat = bpy.data.materials.new(FOG)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    if nt.animation_data:
+        nt.animation_data_clear()
+    nt.nodes.clear()
+    N, L = nt.nodes, nt.links
+
+    def val(name, x, y, v=0.0):
+        n = N.new("ShaderNodeValue")
+        n.name = n.label = name
+        n.location = (x, y)
+        n.outputs[0].default_value = v
+        return n.outputs[0]
+
+    def op(kind, a, b, x, y, clamp=False):
+        n = N.new("ShaderNodeMath")
+        n.operation = kind
+        n.location = (x, y)
+        n.use_clamp = clamp
+        for i, v in enumerate((a, b)):
+            if isinstance(v, (int, float)):
+                n.inputs[i].default_value = v
+            elif v is not None:
+                L.new(v, n.inputs[i])
+        return n.outputs[0]
+
+    out = N.new("ShaderNodeOutputMaterial"); out.location = (1500, 0)
+    vol = N.new("ShaderNodeVolumePrincipled"); vol.name = "R5_Fog"; vol.location = (1200, 0)
+    L.new(vol.outputs[0], out.inputs["Volume"])
+    geo = N.new("ShaderNodeNewGeometry"); geo.location = (-1600, 0)
+    sep = N.new("ShaderNodeSeparateXYZ"); sep.location = (-1400, 200)
+    L.new(geo.outputs["Position"], sep.inputs[0])
+    # height: 0.5 ^ (max(z - base, 0) / thickness)
+    base, thick = val("R5_Fog_Base", -1400, 450), val("R5_Fog_Thickness", -1400, 350, 60.0)
+    h = op("SUBTRACT", sep.outputs["Z"], base, -1200, 450)
+    h = op("MAXIMUM", h, 0.0, -1050, 450)
+    h = op("DIVIDE", h, thick, -900, 450)
+    hf = op("POWER", 0.5, h, -750, 450)
+    # above the layer the fog does not vanish: it keeps "Above the layer" x the base density (as in game)
+    floor = val("R5_Fog_Floor", -750, 600, 0.15)
+    hf = op("MULTIPLY", hf, op("SUBTRACT", 1.0, floor, -600, 600), -600, 450)
+    hf = op("ADD", hf, floor, -450, 450)
+    # patches: 4D noise of the world position, carried by the wind
+    t = val("R5_Fog_Time", -1600, -400)
+    wind = val("R5_Fog_Wind", -1600, -500, 1.5)
+    size = val("R5_Fog_Size", -1600, -600, 120.0)
+    drift = op("MULTIPLY", t, wind, -1400, -450)
+    cx = N.new("ShaderNodeCombineXYZ"); cx.location = (-1200, -450)
+    L.new(drift, cx.inputs["X"])
+    L.new(op("MULTIPLY", drift, 0.35, -1300, -550), cx.inputs["Y"])
+    sub = N.new("ShaderNodeVectorMath"); sub.operation = "SUBTRACT"; sub.location = (-1000, -300)
+    L.new(geo.outputs["Position"], sub.inputs[0])
+    L.new(cx.outputs[0], sub.inputs[1])
+    div = N.new("ShaderNodeVectorMath"); div.operation = "DIVIDE"; div.location = (-800, -300)
+    L.new(sub.outputs[0], div.inputs[0])
+    cs = N.new("ShaderNodeCombineXYZ"); cs.location = (-1000, -550)
+    for k in ("X", "Y"):
+        L.new(size, cs.inputs[k])
+    L.new(op("MULTIPLY", size, 0.45, -1150, -650), cs.inputs["Z"])      # flatter patches, like real mist
+    L.new(cs.outputs[0], div.inputs[1])
+    nz = N.new("ShaderNodeTexNoise"); nz.location = (-600, -300); nz.name = "R5_Fog_Noise"
+    nz.noise_dimensions = "4D"
+    nz.inputs["Scale"].default_value = 1.0
+    nz.inputs["Detail"].default_value = 4.0
+    nz.inputs["Roughness"].default_value = 0.55
+    L.new(div.outputs[0], nz.inputs["Vector"])
+    L.new(op("MULTIPLY", t, 0.015, -800, -500), nz.inputs["W"])
+    mr = N.new("ShaderNodeMapRange"); mr.location = (-400, -300)
+    mr.inputs["From Min"].default_value = 0.32
+    mr.inputs["From Max"].default_value = 0.68
+    L.new(nz.outputs["Fac"], mr.inputs["Value"])
+    patch = val("R5_Fog_Patch", -400, -550, 0.5)
+    # noise factor: 1 - patch + 2 * patch * n  (mean 1: the overall density stays the same)
+    nf = op("MULTIPLY", mr.outputs["Result"], 2.0, -200, -300)
+    nf = op("SUBTRACT", nf, 1.0, -50, -300)
+    nf = op("MULTIPLY", nf, patch, 100, -300)
+    nf = op("ADD", nf, 1.0, 250, -300)
+    nf = op("MAXIMUM", nf, 0.0, 400, -300)
+    # soft borders of the box: no visible wall where the fog ends
+    edge = None
+    for i, (k, lo_n, hi_n) in enumerate((("X", "R5_Fog_X0", "R5_Fog_X1"), ("Y", "R5_Fog_Y0", "R5_Fog_Y1"))):
+        lo_v, hi_v = val(lo_n, -1400, -800 - 200 * i), val(hi_n, -1400, -880 - 200 * i)
+        a = op("SUBTRACT", sep.outputs[k], lo_v, -1200, -800 - 200 * i)
+        b = op("SUBTRACT", hi_v, sep.outputs[k], -1200, -880 - 200 * i)
+        m = op("MINIMUM", a, b, -1050, -840 - 200 * i)
+        edge = m if edge is None else op("MINIMUM", edge, m, -900, -900)
+    edge = op("DIVIDE", edge, 350.0, -750, -900, clamp=True)
+    top = op("SUBTRACT", val("R5_Fog_Z1", -1400, -1300), sep.outputs["Z"], -1200, -1300)
+    top = op("DIVIDE", top, 250.0, -1050, -1300, clamp=True)
+    edge = op("MULTIPLY", edge, top, -600, -1000)
+    dens = op("MULTIPLY", val("R5_Fog_Density", 400, 300, 0.0003), hf, 600, 300)
+    dens = op("MULTIPLY", dens, nf, 750, 150)
+    dens = op("MULTIPLY", dens, edge, 900, 0)
+    L.new(dens, vol.inputs["Density"])
+    # self-lit: the fog tends towards its colour x glow by itself (emission = density x colour x glow), as the
+    # game's fog colour does, whatever the lighting (the night fog of E-District)
+    L.new(op("MULTIPLY", dens, val("R5_Fog_Glow", 900, -200), 1050, -200), vol.inputs["Emission Strength"])
+    mat["r5_fog_ver"] = FOG_VERSION
+    if hasattr(mat, "cycles"):
+        try:
+            mat.cycles.homogeneous_volume = False
+        except AttributeError:
+            pass
+    return mat
 
 
 def _fog_object(scene, s):
-    """Volumetric fog as a volume box around the map. A world volume would be infinite: EEVEE then
+    """Volumetric height fog in a volume box around the map. A world volume would be infinite: EEVEE then
     absorbs the whole sky and the sun (black image)."""
     ob = bpy.data.objects.get(FOG)
     if not s.sky_fog:
         if ob is not None:
-            me, mat = ob.data, bpy.data.materials.get(FOG)
-            bpy.data.objects.remove(ob)
-            if me is not None and me.users == 0:
-                bpy.data.meshes.remove(me)
-            if mat is not None and mat.users == 0:
-                bpy.data.materials.remove(mat)
+            _remove_fog()
         return None
+    if not scene.get("r5_fog_init"):
+        scene["r5_fog_init"] = True
+        fog_from_map(scene)              # first time on: the map's own fog, when the export has it
+    (x0, y0, z0), (x1, y1, z1) = _fog_bounds(scene)
+    box = (x0, y0, z0, x1, y1, z1)
     if ob is None:
-        (x0, y0, z0), (x1, y1, z1) = _fog_bounds(scene)
-        me = bpy.data.meshes.new(FOG)
-        verts = [(x, y, z) for x in (x0, x1) for y in (y0, y1) for z in (z0, z1)]
-        faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
-        me.from_pydata(verts, [], faces)
-        ob = bpy.data.objects.new(FOG, me)
+        ob = bpy.data.objects.new(FOG, bpy.data.meshes.new(FOG))
         ob.display_type = "BOUNDS"
         ob.hide_select = True
         ob["r5_fog"] = True
-        mat = bpy.data.materials.get(FOG) or bpy.data.materials.new(FOG)
-        mat.use_nodes = True
-        nt = mat.node_tree
-        nt.nodes.clear()
-        out = nt.nodes.new("ShaderNodeOutputMaterial"); out.location = (300, 0)
-        vol = nt.nodes.new("ShaderNodeVolumePrincipled"); vol.name = "R5_Fog"
-        nt.links.new(vol.outputs[0], out.inputs["Volume"])
+    me = ob.data
+    if tuple(round(v, 3) for v in ob.get("r5_box", ())) != tuple(round(v, 3) for v in box):
+        verts = [(x, y, z) for x in (x0, x1) for y in (y0, y1) for z in (z0, z1)]
+        faces = [(0, 1, 3, 2), (4, 6, 7, 5), (0, 4, 5, 1), (2, 3, 7, 6), (0, 2, 6, 4), (1, 5, 7, 3)]
+        me.clear_geometry()
+        me.from_pydata(verts, [], faces)
+        me.update()
+        ob["r5_box"] = box
+    mat = _fog_material(scene)
+    if not me.materials:
         me.materials.append(mat)
+    elif me.materials[0] != mat:
+        me.materials[0] = mat
     if ob.name not in scene.collection.objects:
         scene.collection.objects.link(ob)
-    mat = ob.data.materials[0] if ob.data.materials else None
-    if mat is not None and mat.node_tree and "R5_Fog" in mat.node_tree.nodes:
-        _set_fog_values(mat.node_tree.nodes["R5_Fog"], s)
+    _set_fog_values(mat, s, box)
+    tn = mat.node_tree.nodes.get("R5_Fog_Time")
+    ad = mat.node_tree.animation_data
+    if tn is not None and not (ad and ad.drivers):
+        from .motion import _drive
+        _drive(tn.outputs[0], scene, "frame / fps", [("fps", "render.fps")])
     _fog_range(scene, s)
     return ob
 
@@ -259,19 +390,140 @@ def _fog(scene, nt, s):
     _fog_object(scene, s)
 
 
-def _set_fog_values(vol, s):
-    vol.inputs["Density"].default_value = s.sky_fog_density
-    vol.inputs["Color"].default_value = tuple(s.sky_fog_color) + (1.0,)
-    vol.inputs["Anisotropy"].default_value = s.sky_fog_anisotropy
+def _set_fog_values(mat, s, box):
+    nodes = mat.node_tree.nodes
+
+    def put(name, v):
+        n = nodes.get(name)
+        if n is not None and abs(n.outputs[0].default_value - v) > 1e-9:
+            n.outputs[0].default_value = v
+    x0, y0, z0, x1, y1, z1 = box
+    for k, v in (("R5_Fog_X0", x0), ("R5_Fog_X1", x1), ("R5_Fog_Y0", y0), ("R5_Fog_Y1", y1), ("R5_Fog_Z1", z1),
+                 ("R5_Fog_Density", s.sky_fog_density), ("R5_Fog_Base", s.sky_fog_base),
+                 ("R5_Fog_Thickness", max(s.sky_fog_thickness, 0.1)), ("R5_Fog_Patch", s.sky_fog_patchiness),
+                 ("R5_Fog_Size", max(s.sky_fog_patch_size, 0.1)), ("R5_Fog_Wind", s.sky_fog_wind),
+                 ("R5_Fog_Glow", s.sky_fog_glow),
+                 ("R5_Fog_Floor", s.sky_fog_above)):
+        put(k, v)
+    vol = nodes.get("R5_Fog")
+    if vol is not None:
+        vol.inputs["Color"].default_value = tuple(s.sky_fog_color) + (1.0,)
+        vol.inputs["Anisotropy"].default_value = s.sky_fog_anisotropy
+        if "Emission Color" in vol.inputs:
+            vol.inputs["Emission Color"].default_value = tuple(s.sky_fog_color) + (1.0,)
 
 
 def _fog_range(scene, s):
     ee = getattr(scene, "eevee", None)
-    if ee is not None and hasattr(ee, "volumetric_end"):
+    if ee is None:
+        return
+    # volume shadows: the sun makes light shafts through the fog, and the fog is dark in the shade
+    for attr, v in (("volumetric_end", s.sky_fog_distance), ("use_volumetric_shadows", True)):
+        if hasattr(ee, attr):
+            try:
+                setattr(ee, attr, v)
+            except (AttributeError, TypeError):
+                pass
+
+
+# ---- the map's own fog (env_fog_controller) ----
+_FOG_SKIP_RE = re.compile(r"podium|drop|skydive|interior|inside|phaserunner|bunker|cave|tunnel")
+
+
+def pick_map_fog(controllers, volumes):
+    """The fog the player sees over the map: the env_fog_controller of the fog_volume with the lowest priority
+    (the big one), never the drop ship / skydive / victory podium / interior fogs."""
+    by_name = {c.get("targetname", ""): c for c in controllers}
+    cands = []
+    for v in volumes:
+        tgt = v.get("target", "")
+        if tgt in by_name and not _FOG_SKIP_RE.search(tgt.lower()):
+            try:
+                pr = float(v.get("priority", "10"))
+            except ValueError:
+                pr = 10.0
+            cands.append((pr, tgt))
+    if cands:
+        return by_name[min(cands)[1]]
+    ok = [c for c in controllers if not _FOG_SKIP_RE.search(c.get("targetname", "").lower())]
+    main = [c for c in ok if re.search(r"main|level", c.get("targetname", "").lower())]
+    return (main or ok or [None])[0]
+
+
+def _floats(text, n, default):
+    try:
+        v = [float(x) for x in str(text).split()[:n]]
+    except ValueError:
+        return list(default)
+    return v + list(default[len(v):]) if len(v) < n else v
+
+
+def map_fog_record(kv, unit, offset_z):
+    """Game fog parameters converted to meters (Blender Z), for fog_from_map."""
+    def f(k, d=0.0):
         try:
-            ee.volumetric_end = s.sky_fog_distance
-        except (AttributeError, TypeError):
-            pass
+            return float(kv.get(k, d))
+        except (TypeError, ValueError):
+            return d
+    rgb = [max(0.0, min(255.0, c)) / 255.0 for c in _floats(kv.get("fogcolor", ""), 3, (200.0, 200.0, 200.0))]
+    lin = [c ** 2.2 for c in rgb]
+    m = max(max(lin), 1e-4)
+    return {"name": kv.get("targetname", ""), "max": max(0.0, min(1.0, f("fogdensity", 0.3))),
+            "z_bottom": f("fogzbottom") * unit + offset_z, "z_top": f("fogztop") * unit + offset_z,
+            "half_bottom": max(f("foghalfdistbottom", 2000.0), 1.0) * unit,
+            "half_top": max(f("foghalfdisttop", 2000.0), 1.0) * unit,
+            "start": max(f("fogdistoffset"), 0.0) * unit,
+            "color": [0.92 * c / m for c in lin],
+            # brightness of the game's fog colour (colour x colour strength), relative to "color"
+            "glow": m * max(0.0, f("fogcolorstrength", 1.0)) / 0.92}
+
+
+def fog_from_map(scene):
+    """Density, colour, height and thickness from the map's fog. Returns False without map fog.
+    The game fog is a screen effect that stops at its *fogdensity* (40% on E-District); a real volume keeps
+    thickening with distance, so the density is matched to the game at the distance across the map, at the
+    height where the fog is densest."""
+    import json
+    raw = scene.get("r5_map_fog")
+    if not raw:
+        return False
+    try:
+        fog = json.loads(raw)
+    except ValueError:
+        return False
+    s = scene.r5_settings
+    (x0, y0, z0), (x1, y1, z1) = _fog_bounds(scene)
+    ground = z0 + 30.0
+    span = max(500.0, min(3000.0, 0.5 * math.hypot(x1 - x0, y1 - y0)))
+    zb, zt, hb, ht = fog["z_bottom"], fog["z_top"], fog["half_bottom"], fog["half_top"]
+    if zb > zt:
+        zb, zt, hb, ht = zt, zb, ht, hb          # (Storm Point: "bottom" above "top")
+
+    def half(z):                                 # half distance at a height, interpolated as in game
+        if zt - zb < 1e-3:
+            return hb
+        k = max(0.0, min(1.0, (z - zb) / (zt - zb)))
+        return hb + (ht - hb) * k
+    base = max(ground, zb) if hb < ht else ground
+    hd = half(base)
+    # matched between where the game fog is nearly full (start + 3 half distances) and the distance across
+    # the map: thinner than the game up close, thicker far away
+    near = max(100.0, min(1500.0, fog["start"] + 3.0 * hd))
+    ref = math.sqrt(near * max(span, near))
+    frac = fog["max"] * (1.0 - 2.0 ** (-max(ref - fog["start"], 0.0) / hd))
+    frac = max(0.0, min(0.95, frac))
+    s["sky_fog_density"] = -math.log(1.0 - frac) / ref if frac > 0 else 0.0
+    s["sky_fog_glow"] = fog.get("glow", 0.0)
+    if hb < ht * 0.95 and zt - zb > 1.0:
+        # the game thins its fog between its two heights, then keeps the top density
+        thick, above = 0.35 * (zt - zb), hb / ht
+    else:
+        thick, above = 2000.0, 1.0              # as dense higher up: an even layer
+    s["sky_fog_thickness"] = max(10.0, min(2000.0, thick))
+    s["sky_fog_above"] = max(0.0, min(1.0, above))
+    s["sky_fog_base"] = base
+    s["sky_fog_color"] = fog["color"]
+    return True
 
 
 def _finish(scene, w, nt, bg, color, mean_lum, mode):
@@ -669,7 +921,28 @@ class R5_OT_sun_color_reset(bpy.types.Operator):
         return {"FINISHED"}
 
 
-CLASSES = (R5_OT_setup_sky, R5_OT_sun_color_reset)
+class R5_OT_fog_from_map(bpy.types.Operator):
+    """Set the fog from the map's own fog (env_fog_controller of the export): colour, density, base height and
+    thickness"""
+    bl_idname = "r5.fog_from_map"
+    bl_label = "Use the map's fog"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        if not fog_from_map(scene):
+            self.report({"WARNING"}, "No fog in the entities of this map")
+            return {"CANCELLED"}
+        s = scene.r5_settings
+        if not s.sky_fog:
+            s.sky_fog = True
+        else:
+            update_live(scene)
+        self.report({"INFO"}, f"Map fog: {s.sky_fog_density * 1000:.2f} per km, thickness {s.sky_fog_thickness:.0f} m")
+        return {"FINISHED"}
+
+
+CLASSES = (R5_OT_setup_sky, R5_OT_sun_color_reset, R5_OT_fog_from_map)
 
 
 def register():

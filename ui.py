@@ -503,9 +503,22 @@ class R5_PT_sky_fog(_SkySub, bpy.types.Panel):
         s = _settings(context)
         col = self.layout.column()
         col.enabled = s.sky_fog
+        has_map = bool(context.scene.get("r5_map_fog"))
+        row = col.row()
+        row.enabled = has_map
+        row.operator("r5.fog_from_map", icon="IMPORT", text="Use the map's fog" if has_map else "No fog in the map")
         col.prop(s, "sky_fog_density")
         col.prop(s, "sky_fog_color")
+        sub = col.column(align=True)
+        sub.prop(s, "sky_fog_base")
+        sub.prop(s, "sky_fog_thickness")
+        sub.prop(s, "sky_fog_above")
+        sub = col.column(align=True)
+        sub.prop(s, "sky_fog_patchiness")
+        sub.prop(s, "sky_fog_patch_size")
+        sub.prop(s, "sky_fog_wind")
         col.prop(s, "sky_fog_anisotropy")
+        col.prop(s, "sky_fog_glow")
         col.prop(s, "sky_fog_distance")
 
 
@@ -515,7 +528,7 @@ class R5_PT_sky_fog(_SkySub, bpy.types.Panel):
 class R5_PT_motion(_Base, bpy.types.Panel):
     """Moving props and animated materials, switched on after loading (they cost time on every frame)."""
     bl_label = "Animation"
-    bl_order = 6
+    bl_order = 8
     bl_idname = "R5_PT_motion"
     bl_options = {"DEFAULT_CLOSED"}
     draw_header = _icon_header("PLAY")
@@ -581,7 +594,7 @@ class R5_PT_motion_wind(_Sub, bpy.types.Panel):
 # ==========================================================================
 class R5_PT_render(_Base, bpy.types.Panel):
     bl_label = "Camera & Render"
-    bl_order = 7
+    bl_order = 9
     bl_idname = "R5_PT_render"
     draw_header = _icon_header("RENDER_STILL")
 

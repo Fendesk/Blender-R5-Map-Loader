@@ -157,6 +157,9 @@ class EntInfo:
         self.brush = {}         # N -> origin of the entity using brush model "*N" (game units)
         self.rotators = []      # [{origin, angles, axis_index, speed (deg/s), brushes [N], members [origin]}]
         self.lights = []        # [(origin, linear rgb)] light / light_spot entities (the map's real lights)
+        self.effects = []       # [[name, x, y, z, pitch, yaw, roll, scale]] info_particle_system (effects.py)
+        self.fog_controllers = []   # env_fog_controller key values (sky.pick_map_fog)
+        self.fog_volumes = []       # fog_volume key values (target, priority)
 
 
 def _ent_files(paths):
@@ -181,7 +184,8 @@ def _scan_entities(paths):
             continue
         for blk in _ENT_BLOCK_RE.finditer(text):
             b = blk.group(1)
-            if '"*' not in b and "link_guid" not in b and '"light' not in b:
+            if ('"*' not in b and "link_guid" not in b and '"light' not in b and "effect_name" not in b
+                    and "env_fog_controller" not in b):
                 continue
             kv = dict(_KV_RE.findall(b))
             model = kv.get("model", "")
@@ -191,6 +195,15 @@ def _scan_entities(paths):
             if "link_guid" in kv:
                 by_guid[kv["link_guid"]] = kv
             cls = kv.get("classname", "")
+            if cls == "env_fog_controller":
+                info.fog_controllers.append(kv)
+            elif cls == "fog_volume":
+                info.fog_volumes.append(kv)
+            if cls == "info_particle_system":
+                from . import effects
+                rec = effects.entity_record(kv, origin)
+                if rec:
+                    info.effects.append(rec)
             if cls in ("light", "light_spot") and "_light" in kv:
                 rgb = placement._vec(kv["_light"], 4, 255.0)[:3]
                 lin = tuple(max(0.0, min(1.0, c / 255.0)) ** 2.2 for c in rgb)
@@ -235,9 +248,17 @@ def _brush_origins(paths):
     return _scan_entities(paths).brush
 
 
-def _store_entities(scene, info, unit, offset):
-    """Rotators and map lights in Blender coordinates, for motion.py and lights.py."""
+def _store_entities(scene, info, unit, offset, area=None):
+    """Rotators, map lights and effects in Blender coordinates, for motion.py, lights.py and effects.py."""
     from mathutils import Euler
+    from . import effects, sky
+    effects.store(scene, info.effects, unit, offset, area)
+    # the map's own fog (Sky > Fog > Use the map's fog)
+    fog = sky.pick_map_fog(info.fog_controllers, info.fog_volumes)
+    if fog is not None:
+        scene["r5_map_fog"] = json.dumps(sky.map_fog_record(fog, unit, -float(offset[2])))
+    elif "r5_map_fog" in scene:
+        del scene["r5_map_fog"]
     off = np.array(offset[:], dtype=np.float64)
     rots = []
     for r in info.rotators:
@@ -321,6 +342,31 @@ def _map_name(path):
     return n[:-5] if n.lower().endswith("_lod0") else n
 
 
+def _material_params(paths):
+    """Shader constants of the materials (r5mex: <map>_materials.json next to the .mprt / .cast), see
+    castfile.MATERIAL_PARAMS. {} when the export has none."""
+    out = {}
+    for p in paths:
+        d = os.path.dirname(p)
+        for cand in (f"{_map_name(p)}_materials.json", "_materials.json"):
+            fp = os.path.join(d, cand)
+            if not os.path.isfile(long_path(fp)):
+                continue
+            try:
+                with open(long_path(fp), "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, ValueError) as exc:
+                print(f"[R5] {fp}: {exc}")
+                continue
+            if isinstance(data, dict):
+                data = data.get("materials", data)
+            if isinstance(data, dict):
+                out.update(data)
+            elif isinstance(data, list):
+                out.update({m["name"]: m for m in data if isinstance(m, dict) and m.get("name")})
+    return out
+
+
 def is_skybox_file(path):
     return os.path.basename(path).lower().endswith("_skybox.mprt")
 
@@ -357,6 +403,11 @@ def map_loaded(scene):
     return any(c.name.startswith(MAP_ROOTS) or c.name == library.LIB_COLLECTION for c in scene.collection.children)
 
 
+def _clear_effects(scene):
+    from . import effects
+    effects.clear(scene)
+
+
 def clear_map(context):
     """Remove the loaded map(s) from the file: props, map geometry, skybox, model library, city lights, region,
     POIs, movers and the stored offset. Node groups, sky and render settings stay. Returns the objects removed."""
@@ -366,7 +417,7 @@ def clear_map(context):
     if context.object and context.object.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
     for step in (lambda: motion.disable_movers(scene), lambda: lights.clear(scene),
-                 lambda: regions.clear_region(scene)):
+                 lambda: regions.clear_region(scene), lambda: _clear_effects(scene)):
         try:
             step()
         except Exception as exc:  # noqa: BLE001
@@ -396,7 +447,7 @@ def clear_map(context):
     bpy.data.batch_remove([d for d in datas if d.users == 0])
     bpy.data.batch_remove([m for m in bpy.data.materials if m.users == 0])
     bpy.data.batch_remove([i for i in bpy.data.images if i.users == 0])
-    for k in ("apx_offset", "apx_rotators", "apx_map_lights"):
+    for k in ("apx_offset", "apx_rotators", "apx_map_lights", "apx_fx"):
         if k in scene:
             del scene[k]
     s.pois.clear()
@@ -444,6 +495,7 @@ def _import_map(context, paths, report, poi, poi_scale):
         bpy.ops.object.mode_set(mode="OBJECT")
     castfile.clear_image_cache()
     castfile.set_texture_libraries(_texture_libraries(s, paths))
+    castfile.set_material_params(_material_params(paths))
 
     world_paths = [p for p in paths if p.lower().endswith(".cast")]
     place_paths = [p for p in paths if os.path.splitext(p)[1].lower() in PLACEMENT_EXT]
@@ -606,7 +658,7 @@ def _import_map(context, paths, report, poi, poi_scale):
     if not had_offset and abs(offset.z) > 1e-3:
         report(f"Map moved {-offset.z:+.1f} m in Z: its lowest point sits on the ground grid (Z = 0)")
     if not sky_only:
-        _store_entities(scene, ents, unit, offset)
+        _store_entities(scene, ents, unit, offset, area)
 
     # 3) Map geometry ------------------------------------------------------
     progress.stage("Map geometry", 0.70, 0.85)
@@ -700,6 +752,18 @@ def _import_map(context, paths, report, poi, poi_scale):
         motion.after_import(scene)          # movers / animated shaders / LOD fade already switched on
     except Exception as exc:  # noqa: BLE001
         report(f"Movers / shaders: {exc}")
+    try:
+        from . import effects
+        effects.after_import(scene, report)  # map effects, falling leaves, water plane (Effects & water)
+    except Exception as exc:  # noqa: BLE001
+        report(f"Effects: {exc}")
+    try:
+        from . import banners, sky
+        if s.sky_fog:
+            sky._fog_object(scene, s)          # the fog box around the new map
+        banners.after_import(scene, report)    # player banners on the flex screens
+    except Exception as exc:  # noqa: BLE001
+        report(f"Fog / banners: {exc}")
     context.view_layer.update()
     lod_system.apply_all(scene)
     if lod_system.ensure_render_lock(scene):
@@ -767,9 +831,52 @@ def _skybox_backdrop(groups, available, map_keys, offset):
                     out.update(s.material for s in getattr(o, "material_slots", ()) if s.material)
         return out
     lit = materials(others) | materials(map_keys & set(available))
+    vc = _vc_stats([o for k in domes for c in available[k][:1] for o in c.all_objects])
     for mat in materials(domes) - lit:
-        castfile.make_unlit(mat)
+        rgb, varies = vc.get(mat.name, (1.0, False))
+        castfile.make_unlit(mat, drop_tint=rgb < 0.35, vc_alpha=varies)
     return len(domes)
+
+
+def _vc_stats(objects):
+    """{material name: (mean vertex colour brightness, vertex alpha varies)} of the faces using it. The cards
+    of a sky dome (clouds, traffic) have a near-black vertex colour that is not a tint, and a vertex alpha that
+    fades them out at their borders."""
+    acc = {}
+    for o in objects:
+        if o.type != "MESH" or not o.data.polygons:
+            continue
+        me = o.data
+        col = me.color_attributes.get("Col") if hasattr(me, "color_attributes") else None
+        if col is None:
+            continue
+        n = len(col.data)
+        c = np.empty(n * 4, np.float32)
+        col.data.foreach_get("color", c)
+        c = c.reshape(-1, 4)
+        npoly = len(me.polygons)
+        mi = np.empty(npoly, np.int32); me.polygons.foreach_get("material_index", mi)
+        if col.domain == "CORNER":
+            lt = np.empty(npoly, np.int32); me.polygons.foreach_get("loop_total", lt)
+            per = np.repeat(mi, lt)             # loops are stored polygon after polygon
+        else:
+            cv = np.empty(len(me.loops), np.int32); me.loops.foreach_get("vertex_index", cv)
+            lt = np.empty(npoly, np.int32); me.polygons.foreach_get("loop_total", lt)
+            per = np.full(n, -1, np.int32)
+            per[cv] = np.repeat(mi, lt)
+        if len(per) != len(c):
+            continue
+        for i, slot in enumerate(o.material_slots):
+            if slot.material is None:
+                continue
+            sel = c[per == i]
+            if not len(sel):
+                continue
+            s = acc.setdefault(slot.material.name, [0.0, 0, 0])
+            s[0] += float(sel[:, :3].max(1).sum())
+            s[1] += len(sel)
+            s[2] += int((sel[:, 3] < 0.98).sum())
+    return {k: (v[0] / v[1], v[2] > 0.02 * v[1]) for k, v in acc.items() if v[1]}
 
 
 def fit_clip_to_sky(context, scene):
