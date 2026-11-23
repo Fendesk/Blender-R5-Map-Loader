@@ -1,4 +1,4 @@
-# Blender R5 Map Loader 0.19.5 (Blender 4.2 to 5.3)
+# Blender R5 Map Loader 0.21.0 (Blender 4.2 to 5.3)
 
 Loads R5Reloaded / Apex Legends map exports into Blender: map geometry, static and dynamic props, 3D skybox,
 ziplines, POIs and the map's sun. Handles instancing, dynamic LODs, off-screen unloading, regions / POIs, sky,
@@ -6,7 +6,7 @@ city lights, movers / animated shaders and a Cycles setup.
 
 ## Install
 Blender > Edit > Preferences > Get Extensions > ▾ (top right) > **Install from Disk…** >
-`Blender-R5-Map-Loader-0.19.5.zip`.
+`Blender-R5-Map-Loader-0.21.0.zip`.
 Uninstall the previous version first, **restart Blender**, then import the map into an empty file.
 The panels are in 3D View > Sidebar (N) > **R5 Map Loader**. The importer is also in File > Import.
 While a map loads, a progress bar shows the current step in Blender's status bar.
@@ -48,15 +48,32 @@ In the order of the work, most used buttons on top, rarely used settings in clos
   LOD generation, placement & filters.
 - **Display**: show / hide triggers, tool brushes, light shafts, mist cards, barriers, dev textures, and each
   prop model (*Prop models*).
-- **Regions / POI**: show only one or several POIs (or grid sectors). Everything outside is fully disabled.
+- **Regions / POI**: show only one or several POIs (or grid sectors). Everything outside is fully disabled,
+  except the 3D skybox, which stays around the region as in game.
 - **Performance (LOD & culling)**: how many props are hidden right now, with *Show everything*; *Levels of
   detail*, *Unloading (FPS)* (outside the view, too small on screen, too far), *Update timing*, and *Scene
   tools* (viewport texture limit, 512 by default, needed to keep a full map within video memory). Props larger
   than *Always keep props larger than* (10 m) are never hidden by their size. Generated LODs (r5mex exports LOD0
   only) skip big models and architecture (*Never decimate*) and keep at least 25% of the faces.
 - **Sky**: procedural sky, HDRI, in-game sky dome or cubemap, with *Sun*, *Atmosphere* and *Fog* sub-panels.
+  *Fog* is a volumetric height fog lit by the sun and the sky: dense at its *Base height*, thinning out over its
+  *Thickness* down to *Above the layer*, broken into drifting *Patches* (they move with the *Wind* when the
+  timeline plays), with light shafts in EEVEE. Switched on the first time, it starts from the map's own fog
+  (the `env_fog_controller` of the export: colour, density, heights); *Use the map's fog* sets it back.
 - **City lights**: creates lights on lamps, signs and screens, per type (point / spot / area), with the map's
   light colours.
+- **Effects & water**: *Map effects* (on by default) draws the effects the map places (its
+  `info_particle_system` entities): sparks & fireworks, electricity, fire & lava embers, steam & smoke, water
+  spray, snow, fog & mist, dust & pollen, insects, blinking lights, glows. The game's particle systems are not in
+  the exports: each effect is recognised by its name and drawn by a procedural particle system that moves when the
+  timeline plays. *Effect types* (closed) shows / hides each kind, with its amount, size, strength and colour.
+  *Falling leaves* makes leaves fall from every tree of the map (in the colour of its foliage), plus the leaf and
+  petal effects of the map. *Water plane* adds a large water surface around the map, with animated waves
+  (swell, chop and ripples, in metres: *Waves* scales them); *Detect* puts it at the level of the map's own water.
+- **Player banners**: banner images (PNG, JPG...) on the flex screens of the maps
+  (`survival_modular_flexscreens`: the tall screens of E-District, Olympus, World's Edge, Storm Point). Add one
+  image or several: each screen gets one at random (or the selected one everywhere), filling the screen without
+  stretching, readable from both sides. *Glow* sets their brightness. Kept for the next imports.
 - **Animation**: map rotators, fans and turbines turn; water, lava, screens, energy and foliage animate.
   Off by default: start them once the map is loaded, then play the timeline. *Speeds* and *Foliage wind* below.
 - **Camera & Render**: **New camera from view** creates a camera exactly where the 3D view looks from (position,
