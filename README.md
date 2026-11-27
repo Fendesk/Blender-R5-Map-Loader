@@ -4,6 +4,14 @@ Loads R5Reloaded / Apex Legends map exports into Blender: map geometry, static a
 ziplines, POIs and the map's sun. Handles instancing, dynamic LODs, off-screen unloading, regions / POIs, sky,
 city lights, movers / animated shaders and a Cycles setup.
 
+##  B3D version and hardware spec recommendations
+
+### For RTX 50 Blackwell users ONLY
+Br5ML is working on every versions of B3D from 4.2 to the latest 5.3 release, but I recommend using the latest 5.3 
+version since they integrates DLSS 4.5 Ray Reconstruction as a new denoiser. This will help your pc to handle the 
+viewport rendered scene (especially cycles) so much faster than using OptiX or OID (it's more efficient if you're 
+working on huge scene like full Apex maps).
+
 ## Install
 Blender > Edit > Preferences > Get Extensions > ▾ (top right) > **Install from Disk…** >
 `Blender-R5-Map-Loader-0.21.0.zip`.
