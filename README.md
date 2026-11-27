@@ -8,8 +8,8 @@ city lights, movers / animated shaders and a Cycles setup.
 
 ### For RTX 50 Blackwell users ONLY
 Br5ML is working on every versions of B3D from 4.2 to the latest 5.3 release, but I recommend using the latest 5.3 
-version since they integrates DLSS 4.5 Ray Reconstruction as a new denoiser. This will help your pc to handle the 
-viewport rendered scene (especially cycles) so much faster than using OptiX or OID (it's more efficient if you're 
+version since they integrates DLSS 4.5 Ray Reconstruction as a new denoiser. This will help your pc to load and move in the 
+viewport rendered scene so much faster and smoother than using OptiX or OID (it's more efficient if you're 
 working on huge scene like full Apex maps).
 
 ## Install
