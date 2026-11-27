@@ -1,16 +1,25 @@
-# Blender R5 Map Loader 0.21.0 (Blender 4.2 to 5.3)
+# Blender R5 Map Loader 0.21.0
 
 Loads R5Reloaded / Apex Legends map exports into Blender: map geometry, static and dynamic props, 3D skybox,
 ziplines, POIs and the map's sun. Handles instancing, dynamic LODs, off-screen unloading, regions / POIs, sky,
 city lights, movers / animated shaders and a Cycles setup.
 
 ##  B3D version and hardware spec recommendations
+Br5ML is working on every versions of B3D from 4.2 to the latest 5.3 release including LTS versions.
+System Requirements | MINIMUM | RECOMMENDED
+--- | --- | ---
+VRAM | 6 GB | 16 GB
+RAM | 32 GB | 64 GB
+CPU | 6 cores | 10 cores
 
-### For RTX 50 Blackwell users ONLY
-Br5ML is working on every versions of B3D from 4.2 to the latest 5.3 release, but I recommend using the latest 5.3 
-version since they integrates DLSS 4.5 Ray Reconstruction as a new denoiser. This will help your pc to load and move in the 
-viewport rendered scene so much faster and smoother than using OptiX or OID (it's more efficient if you're 
-working on huge scene like full Apex maps).
+<ins> **For RTX 50 Blackwell users ONLY:** </ins>\
+I recommend using the latest 5.3 version since they integrates DLSS 4.5 Ray Reconstruction as a new denoiser.
+This will help your pc to load and move in the viewport rendered scene so much faster and smoother than
+using OptiX or OID (it's more efficient if you're working on huge scene like full Apex maps).
+> [!CAUTION]
+> B3D DLSS 4.5 require to use the latest 621.40 NVIDIA Driver release.\
+> DO NOT USE ANY PRE 621.40 VERSION\
+> They have an excessive SSD-writing bug that can damage your SSD.
 
 ## Install
 Blender > Edit > Preferences > Get Extensions > ▾ (top right) > **Install from Disk…** >
