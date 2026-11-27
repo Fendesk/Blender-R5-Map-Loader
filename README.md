@@ -6,7 +6,7 @@ city lights, movers / animated shaders and a Cycles setup.
 
 ##  B3D version and hardware spec recommendations
 Br5ML is working on every versions of B3D from 4.2 to the latest 5.3 release including LTS versions.
-Keep in min that this add-on require a high end device : loading full `.mprt` is around 450 000 props and 2 000 000 triangles, 
+Keep in min that this add-on require a high end device : loading full `.mprt` is around **450 000** props and **2 000 000** triangles, 
 so it takes a lot of computing ressource. Having the _RECOMMENDED_ system specs is a must have.
 
 
