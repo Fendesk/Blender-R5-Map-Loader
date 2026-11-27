@@ -6,7 +6,7 @@ city lights, movers / animated shaders and a Cycles setup.
 
 ##  B3D version and hardware spec recommendations
 Br5ML is working on every versions of B3D from 4.2 to the latest 5.3 release including LTS versions.
-This add-on require a high end device : loading an r5 map takes a lot of computing ressource. Having the _RECOMMENDED_ system specs is a must have.
+This add-on require a high end device : loading full `.mprt` takes a lot of computing ressource. Having the _RECOMMENDED_ system specs is a must have.
 
 
 System Requirements | MINIMUM | RECOMMENDED
